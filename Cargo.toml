@@ -1,0 +1,16 @@
+[package]
+name = "rotonda-fsm"
+version = "0.1.0-dev"
+edition = "2021"
+authors = ["The NLnet Labs RPKI Team <rpki@nlnetlabs.nl>"]
+description = "Protocol state machines for Rotonda data ingress/egress"
+repository = "https://github.com/NLnetLabs/rotonda-fsm"
+license = "BSD-3-Clause"
+readme = "README.md"
+
+
+[[bin]]
+name = "bgpsink"
+path = "src/bgpsink.rs"
+
+[dependencies]
