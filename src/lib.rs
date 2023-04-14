@@ -1,4 +1,4 @@
 //! Finite state machines for BGP/BMP protocol handling.
 
-mod bgp;
+pub mod bgp;
 mod bmp;

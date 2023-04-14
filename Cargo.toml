@@ -8,9 +8,15 @@ repository = "https://github.com/NLnetLabs/rotonda-fsm"
 license = "BSD-3-Clause"
 readme = "README.md"
 
+[dev-dependencies]
+bytes = "1.1.0"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.9.0"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 
-[[bin]]
-name = "bgpsink"
-path = "src/bgpsink.rs"
 
 [dependencies]
+log = { version = "0.4.17" }
+octseq = { git = "https://github.com/NLnetLabs/octseq", features = ["bytes"] }
+routecore = { git = "https://github.com/NLnetLabs/routecore", branch = "aspath-with-hops", features = ["bmp"] }
+tokio = { version = "1", features = ["net", "sync"] }
