@@ -10,6 +10,8 @@ use std::time::Instant;
 // fields, that would be the corresponding _timer fields, most likely.
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
+// XXX make SessionAttributes generic over marker::PhantomData for State and
+// leverage the type system with impl From's ? 
 pub struct SessionAttributes {
     // mandatory
     
@@ -79,7 +81,7 @@ impl SessionAttributes {
         self.connect_retry_counter += 1;
     }
 
-    pub fn to_state(&mut self, state: State) {
+    pub fn set_state(&mut self, state: State) {
         debug!("FSM {:?} -> {:?}", &self.state, state);
         self.state = state;
     }

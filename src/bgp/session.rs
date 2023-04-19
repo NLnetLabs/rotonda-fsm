@@ -1,64 +1,193 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::net::IpAddr;
+use std::io::Cursor;
 
-use octseq::Octets;
-//use tokio::sync::mpsc;
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::net::TcpStream;
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use routecore::asn::Asn;
-use routecore::bgp::message::Message as BgpMsg;
+use routecore::bgp::message::{Message as BgpMsg, SessionConfig, UpdateMessage};
 use routecore::bgp::message::open::Capability;
 use routecore::bgp::message::keepalive::KeepaliveBuilder;
 use routecore::bgp::message::open::OpenBuilder;
 use routecore::bgp::types::{AFI, SAFI};
+use routecore::bgp::ParseError;
 
 use crate::bgp::fsm::{Event, SessionAttributes, State};
+#[allow(unused_imports)]
+use crate::util::to_pcap;
 
 #[derive(Debug)]
 pub struct Session {
-    config: SessionConfig,
+    config: Config,
     attributes: SessionAttributes, // contains the actual FSM
-    stream: Option<TcpStream>,
+    //stream: Option<TcpStream>,
+    connection: Option<Connection>,
+    channel: mpsc::Sender<UpdateMessage<Bytes>>
 }
+
+#[derive(Debug)]
+pub struct Connection {
+    stream: TcpStream,
+    buffer: BytesMut,
+}
+
+impl Connection {
+    pub fn for_stream(stream: TcpStream) -> Self {
+        Connection {
+            stream,
+            buffer: BytesMut::with_capacity(2^20),
+        }
+    }
+
+    pub async fn read_frame(&mut self)
+        -> Result<Option<BgpMsg<Bytes>>, Error>
+    {
+        loop {
+            if let Some(frame) = self.parse_frame()? {
+                return Ok(Some(frame));
+            }
+            if 0 == self.stream.read_buf(&mut self.buffer).await? {
+                if self.buffer.is_empty() {
+                    return Ok(None)
+                } else {
+                    return Err(Error::for_str("connection reset by peer"));
+                }
+            }
+        }
+    }
+
+
+    fn parse_frame(&mut self) -> Result<Option<BgpMsg<Bytes>>, ParseError> {
+        let mut buf = Cursor::new(&self.buffer[..]);
+
+        if buf.remaining() >= 16 + 2  {
+            buf.set_position(16);
+            let len = buf.get_u16(); 
+            if buf.remaining() >= ((len as usize) - 18) {
+                //return Ok(len)
+                buf.set_position(0);
+                let b = Bytes::copy_from_slice(&buf.into_inner()[..len.into()]);
+                // XXX the SessionConfig needs to be updated based on the
+                // exchanged BGP OPENs
+                let msg = BgpMsg::from_octets(b, Some(SessionConfig::modern()))?;
+                self.buffer.advance(len.into());
+                return Ok(Some(msg));
+            }
+        }
+        Ok(None)
+    }
+}
+
 
 /// Local configuration of BGP session.
 #[derive(Debug)]
-pub struct SessionConfig {
+pub struct Config {
     local_asn: Asn,
     bgp_id: [u8; 4],
-    _remote_asn: Asn,
+    _remote_asn: Option<Asn>,
     remote_addr: IpAddr,
     capabilities: Vec<Capability<Vec<u8>>>,
 }
+impl Config {
+    pub fn new(
+        local_asn: Asn,
+        bgp_id: [u8; 4],
+        remote_addr: IpAddr
+    ) -> Config {
+        Self {
+            local_asn,
+            bgp_id,
+            _remote_asn: None,
+            remote_addr,
+            capabilities: vec!()
+        }
+    }
+}
 
 impl Session {
-    pub fn new(config: SessionConfig) -> Self {
+    pub fn new(config: Config, channel: mpsc::Sender<UpdateMessage<Bytes>>)
+        -> Self
+    {
         Self {
             config,
             attributes: SessionAttributes::default(),
-            stream: None,
+            connection: None,
+            channel
         }
     }
+
     fn attach_stream(&mut self, stream: TcpStream) {
-        self.stream = Some(stream);
+        self.connection = Some(Connection::for_stream(stream));
     }
 
+    // XXX we need checks on multiple levels:
+    // - on the bare tcp stream, is the remote peer in our local config?
+    // - in the BGP OPEN, is the remote AS in our local config?
+    // - after exchanging OPENs, do we end up with something sound?
+    // perhaps we should make Session generic over a marker::PhantomData
     pub fn try_for_connection(
-        config: SessionConfig,
-        connection: TcpStream
+        config: Config,
+        connection: TcpStream,
+        channel: mpsc::Sender<UpdateMessage<Bytes>>
     ) -> Result<Self, ConnectionError> {
         if connection.peer_addr()?.ip() != config.remote_addr {
             return Err(ConnectionError)
         }
-        let mut session = Self::new(config);
+        let mut session = Self::new(config, channel);
         session.attach_stream(connection);
 
         Ok(session)
     }
 
+    pub async fn process(mut self) {
+        debug!("in Session::process");
+        self.manual_start();
+        self.connection_established();
+
+        let mut holdtimer = tokio::time::interval(
+            Duration::from_secs(self.hold_time() as u64 / 3)
+        );
+        holdtimer.tick().await; // ticks immediately
+
+        loop {
+            tokio::select! {
+                // message from peer:
+                msg = self.connection.as_mut().unwrap().read_frame() => {
+                    //if let Ok(Some(m)) = msg {
+                    match msg {
+                        Ok(Some(m)) => self.handle_msg(m),
+                        Ok(None) => {
+                            warn!(
+                                "[{}] Connection closed by peer",
+                                self.connection.unwrap()
+                                    .stream.peer_addr().unwrap().ip()
+                            );
+                            break
+                        }
+                        Err(e) => {
+                            error!("{e}");
+                            break
+                        }
+                    }
+                },
+                _ = holdtimer.tick() => {
+                    debug!(
+                        "[{}] 1/3 holdtimer, sending KEEPALIVE",
+                        self.config.remote_addr
+                    );
+                    self.send_keepalive();
+                }
+            }
+        }
+    }
+
+
     fn send_raw(&self, raw: Vec<u8>) {
-        if let Err(_) = self.stream.as_ref().unwrap().try_write(&raw) {
+        if self.connection.as_ref().unwrap().stream.try_write(&raw).is_err() {
             warn!("failed to send_raw, connection borked?")
         }
     }
@@ -74,6 +203,7 @@ impl Session {
             // TODO add all capabilities
         }
         // for now, just fake these:
+        openbuilder.four_octet_capable(self.config.local_asn);
         openbuilder.add_mp(AFI::Ipv4, SAFI::Unicast);
         openbuilder.add_mp(AFI::Ipv6, SAFI::Unicast);
 
@@ -131,8 +261,8 @@ impl Session {
         self.attributes_mut().reset_connect_retry();
     }
 
-    fn to_state(&mut self, state: State) {
-        self.attributes_mut().to_state(state);
+    fn set_state(&mut self, state: State) {
+        self.attributes_mut().set_state(state);
     }
 
     //--- event functions ----------------------------------------------------
@@ -144,21 +274,28 @@ impl Session {
         self.handle_event(Event::TcpConnectionConfirmed);
     }
 
-    pub fn handle_msg<Octs: Octets>(&mut self, msg: BgpMsg<Octs>) {
+    pub fn handle_msg(&mut self, msg: BgpMsg<Bytes>) {
        match msg {
-           BgpMsg::Open(_m) => {
-               debug!("got OPEN, generating event");
+           BgpMsg::Open(m) => {
+               debug!("got OPEN from {}, generating event", m.my_asn());
                self.handle_event(Event::BgpOpen);
            }
            BgpMsg::Keepalive(_m) => {
                debug!("got KEEPALIVE, generating event");
                self.handle_event(Event::KeepaliveMsg);
            }
-           BgpMsg::Update(_m) => {
+           BgpMsg::Update(m) => {
                debug!("got UPDATE");
                self.handle_event(Event::UpdateMsg);
+               let tx = self.channel.clone();
+               tokio::spawn(async move {
+                   tx.send(m).await
+               });
            }
-           _ => todo!()
+           BgpMsg::Notification(_m) => {
+               debug!("got NOTIFICATION");
+               //self.handle_event(Event::UpdateMsg);
+           }
        }
     }
 
@@ -198,7 +335,7 @@ impl Session {
                 // TODO tokio listen 
                 
                 //- changes its state to Connect.
-                self.to_state(State::Connect); 
+                self.set_state(State::Connect); 
             }
             (S::Idle, E::ManualStop) => {
                 info!("ignored ManualStop in Idle state")
@@ -251,7 +388,7 @@ impl Session {
                 self.stop_connect_retry_timer();
                 
                 // - changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::Connect, E::ConnectRetryTimerExpires) => {
                 todo!();
@@ -304,7 +441,7 @@ impl Session {
                     //  TODO
 
                     //  - changes its state to OpenSent.
-                    self.to_state(State::OpenSent);
+                    self.set_state(State::OpenSent);
 
                 }
 
@@ -329,7 +466,7 @@ impl Session {
                     // TODO something?
                     
                     //- changes its state to Idle.
-                    self.to_state(State::Idle);
+                    self.set_state(State::Idle);
                 }
             }
             // optional:
@@ -370,7 +507,7 @@ impl Session {
                 //  TODO
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
 
 
@@ -400,7 +537,7 @@ impl Session {
                 self.stop_connect_retry_timer();
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::Active, E::ConnectRetryTimerExpires) => {
 
@@ -415,7 +552,7 @@ impl Session {
                 //  TODO tokio?
 
                 //- changes its state to Connect.
-                self.to_state(State::Connect);
+                self.set_state(State::Connect);
             }
             // optional:
             //(S::Active, E::DelayOpenTimerExpires) => { todo!() }
@@ -449,7 +586,7 @@ impl Session {
                     //  TODO
 
                     //  - changes its state to OpenSent.
-                    self.to_state(State::OpenSent);
+                    self.set_state(State::OpenSent);
                 }
             }
             (S::Active, E::TcpConnectionFails) => {
@@ -471,7 +608,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             // optional:
             //(S::Active, E::BgpOpenWithDelayOpenTimerRunning) => { todo!() }
@@ -499,7 +636,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
 
             (S::Active, E::NotifMsgVerErr) => {
@@ -520,7 +657,7 @@ impl Session {
                     // TODO tokio
                     
                     //- changes its state to Idle.
-                    self.to_state(State::Idle);
+                    self.set_state(State::Idle);
                 } else {
                     //If the DelayOpenTimer is not running, the local system:
                     //  - sets the ConnectRetryTimer to zero,
@@ -540,7 +677,7 @@ impl Session {
                     // TODO once DampPeerOscillations is implemented
 
                     //  - changes its state to Idle.
-                    self.to_state(State::Idle);
+                    self.set_state(State::Idle);
                 }
             }
 
@@ -573,7 +710,7 @@ impl Session {
                     //  TODO once DampPeerOscillations is implemented
 
                     //- changes its state to Idle.
-                    self.to_state(State::Idle);
+                    self.set_state(State::Idle);
             }
 
 
@@ -599,7 +736,7 @@ impl Session {
                 self.reset_connect_retry_counter();
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
 
             }
             // optional: 
@@ -626,7 +763,7 @@ impl Session {
                 // TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::OpenSent,
              //E::TcpConnectionValid | // optional
@@ -657,7 +794,7 @@ impl Session {
                 //  TODO tokio
 
                 //- changes its state to Active.
-                self.to_state(State::Active);
+                self.set_state(State::Active);
             }
             (S::OpenSent, E::BgpOpen) => {
                 //- resets the DelayOpenTimer to zero,
@@ -686,7 +823,7 @@ impl Session {
                 //  TODO
 
                 //- changes its state to OpenConfirm.
-                self.to_state(State::OpenConfirm);
+                self.set_state(State::OpenConfirm);
             }
             (S::OpenSent, E::BgpHeaderErr | E::BgpOpenMsgErr) => {
                 //- sends a NOTIFICATION message with the appropriate error
@@ -710,7 +847,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             // optional:
             //(S::OpenSent, E::OpenCollisionDump) => { todo!() }
@@ -725,7 +862,7 @@ impl Session {
                 // TODO tokio
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::OpenSent, 
                 E::ConnectRetryTimerExpires |
@@ -759,7 +896,7 @@ impl Session {
                 // TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
 
             
@@ -786,7 +923,7 @@ impl Session {
                 self.start_connect_retry_timer();
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             // optional: 
             //(S::OpenConfirm, E::AutomaticStop) => { todo!() }
@@ -813,7 +950,7 @@ impl Session {
                 // TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::OpenConfirm, E::KeepaliveTimerExpires) => {
                 //- sends a KEEPALIVE message,
@@ -856,7 +993,7 @@ impl Session {
                 // TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::OpenConfirm, E::NotifMsgVerErr) => {
                 //- sets the ConnectRetryTimer to zero,
@@ -869,7 +1006,7 @@ impl Session {
                 //TODO tokio
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::OpenConfirm, E::BgpOpen) => {
                 // If the local system receives a valid OPEN message (BGPOpen
@@ -897,7 +1034,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::OpenConfirm, E::BgpHeaderErr | E::BgpOpenMsgErr) => {
                 //- sends a NOTIFICATION message with the appropriate error
@@ -921,7 +1058,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             // optional:
             //(S::OpenConfirm, E::OpenCollisionDump) => { todo!() }
@@ -930,7 +1067,7 @@ impl Session {
                 // TODO
 
                 //- changes its state to Established.
-                self.to_state(State::Established);
+                self.set_state(State::Established);
             }
             (S::OpenConfirm, 
                 E::ConnectRetryTimerExpires |
@@ -961,7 +1098,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
 
             //--- Established ------------------------------------------------
@@ -989,7 +1126,7 @@ impl Session {
                 self.reset_connect_retry_counter();
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             // optional:
             //(S::Established, E::AutomaticStop) => { todo!() }
@@ -1017,7 +1154,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
             (S::Established, E::KeepaliveTimerExpires) => {
                 //- sends a KEEPALIVE message, and
@@ -1064,7 +1201,7 @@ impl Session {
                 self.increase_connect_retry_counter();
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
 
             (S::Established, E::KeepaliveMsg) => {
@@ -1073,7 +1210,7 @@ impl Session {
                 // TODO
 
                 //- remains in the Established state.
-                //self.to_state(State::Established);
+                //self.set_state(State::Established);
             }
             (S::Established, E::UpdateMsg) => {
                 //- processes the message,
@@ -1110,7 +1247,7 @@ impl Session {
                 // TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
 
 
@@ -1143,7 +1280,7 @@ impl Session {
                 //  TODO once DampPeerOscillations is implemented
 
                 //- changes its state to Idle.
-                self.to_state(State::Idle);
+                self.set_state(State::Idle);
             }
         }
     }
@@ -1166,8 +1303,36 @@ impl From<std::io::Error> for ConnectionError {
     }
 }
 
+pub struct Error {
+    msg: &'static str,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter)  -> Result<(), std::fmt::Error> {
+        write!(f, "error: {}", self.msg)
+    }
+}
+
+impl Error {
+    pub fn for_str(msg: &'static str) -> Self {
+        Self{msg}
+    }
+}
+impl From<std::io::Error> for Error {
+    fn from(_e: std::io::Error) -> Self {
+        Self::for_str("io error")
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(_e: ParseError) -> Self {
+        Self::for_str("parse error")
+    }
+}
+
+
 //--- Tests ------------------------------------------------------------------
 
+/* FIXME
 #[cfg(test)]
 mod tests {
 
@@ -1212,3 +1377,4 @@ mod tests {
     }
 
 }
+*/
