@@ -9,7 +9,12 @@ use tokio::sync::mpsc;
 
 use log::{debug, error, info, warn};
 use routecore::asn::Asn;
-use routecore::bgp::message::{Message as BgpMsg, SessionConfig, UpdateMessage};
+use routecore::bgp::message::{
+    NotificationMessage,
+    Message as BgpMsg,
+    SessionConfig,
+    UpdateMessage,
+};
 use routecore::bgp::message::open::Capability;
 use routecore::bgp::message::keepalive::KeepaliveBuilder;
 use routecore::bgp::message::open::OpenBuilder;
@@ -24,9 +29,14 @@ use crate::util::to_pcap;
 pub struct Session {
     config: Config,
     attributes: SessionAttributes, // contains the actual FSM
-    //stream: Option<TcpStream>,
     connection: Option<Connection>,
-    channel: mpsc::Sender<UpdateMessage<Bytes>>
+    channel: mpsc::Sender<Message>
+}
+
+pub enum Message {
+    UpdateMessage(UpdateMessage<Bytes>),
+    NotificationMessage(NotificationMessage<Bytes>),
+    Attributes(SessionAttributes),
 }
 
 #[derive(Debug)]
@@ -109,7 +119,7 @@ impl Config {
 }
 
 impl Session {
-    pub fn new(config: Config, channel: mpsc::Sender<UpdateMessage<Bytes>>)
+    pub fn new(config: Config, channel: mpsc::Sender<Message>)
         -> Self
     {
         Self {
@@ -132,7 +142,7 @@ impl Session {
     pub fn try_for_connection(
         config: Config,
         connection: TcpStream,
-        channel: mpsc::Sender<UpdateMessage<Bytes>>
+        channel: mpsc::Sender<Message>
     ) -> Result<Self, ConnectionError> {
         if connection.peer_addr()?.ip() != config.remote_addr {
             return Err(ConnectionError)
@@ -140,13 +150,15 @@ impl Session {
         let mut session = Self::new(config, channel);
         session.attach_stream(connection);
 
+        // fast-forward our FSM
+        session.manual_start();
+        session.connection_established();
+
         Ok(session)
     }
 
     pub async fn process(mut self) {
         debug!("in Session::process");
-        self.manual_start();
-        self.connection_established();
 
         let mut holdtimer = tokio::time::interval(
             Duration::from_secs(self.hold_time() as u64 / 3)
@@ -156,10 +168,9 @@ impl Session {
         loop {
             tokio::select! {
                 // message from peer:
-                msg = self.connection.as_mut().unwrap().read_frame() => {
-                    //if let Ok(Some(m)) = msg {
+                msg = self.connection.as_mut().unwrap().read_frame() => { // XXX MUT
                     match msg {
-                        Ok(Some(m)) => self.handle_msg(m),
+                        Ok(Some(m)) => self.handle_msg(m), // XXX MUT
                         Ok(None) => {
                             warn!(
                                 "[{}] Connection closed by peer",
@@ -289,25 +300,19 @@ impl Session {
                self.handle_event(Event::UpdateMsg);
                let tx = self.channel.clone();
                tokio::spawn(async move {
-                   tx.send(m).await
+                   tx.send(Message::UpdateMessage(m)).await
                });
            }
-           BgpMsg::Notification(_m) => {
+           BgpMsg::Notification(m) => {
                debug!("got NOTIFICATION");
                //self.handle_event(Event::UpdateMsg);
+               let tx = self.channel.clone();
+               tokio::spawn(async move {
+                   tx.send(Message::NotificationMessage(m)).await
+               });
            }
        }
     }
-
-    //--- emitting over channel ----------------------------------------------
-    //fn send_raw(&self, raw: T) {
-    //fn send_raw(&self, raw: Vec<u8>) {
-    //    //debug!("should send out {:?}...", &raw.as_ref()[..10]);
-    //    let tx = self.channel.clone().unwrap();
-    //    tokio::spawn( async move {
-    //        tx.send(raw.to_vec()).await;
-    //    });
-    //}
 
     // state machine transitions
     fn handle_event(&mut self, event: Event) {
