@@ -5,7 +5,7 @@ use std::io::Cursor;
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::net::TcpStream;
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use log::{debug, error, info, warn};
 use routecore::asn::Asn;
@@ -30,13 +30,19 @@ pub struct Session {
     config: Config,
     attributes: SessionAttributes, // contains the actual FSM
     connection: Option<Connection>,
-    channel: mpsc::Sender<Message>
+    channel: mpsc::Sender<Message>,
+    commands: mpsc::Receiver<Command>,
 }
 
 pub enum Message {
     UpdateMessage(UpdateMessage<Bytes>),
     NotificationMessage(NotificationMessage<Bytes>),
     Attributes(SessionAttributes),
+}
+
+#[derive(Debug)]
+pub enum Command {
+    Attributes// { resp: oneshot::Sender<SessionAttributes> }
 }
 
 #[derive(Debug)]
@@ -119,14 +125,19 @@ impl Config {
 }
 
 impl Session {
-    pub fn new(config: Config, channel: mpsc::Sender<Message>)
+    pub fn new(
+        config: Config,
+        channel: mpsc::Sender<Message>,
+        commands: mpsc::Receiver<Command>,
+        )
         -> Self
     {
         Self {
             config,
             attributes: SessionAttributes::default(),
             connection: None,
-            channel
+            channel,
+            commands,
         }
     }
 
@@ -143,18 +154,19 @@ impl Session {
         config: Config,
         connection: TcpStream,
         channel: mpsc::Sender<Message>
-    ) -> Result<Self, ConnectionError> {
+    ) -> Result<(Self, mpsc::Sender<Command>), ConnectionError> {
         if connection.peer_addr()?.ip() != config.remote_addr {
             return Err(ConnectionError)
         }
-        let mut session = Self::new(config, channel);
+        let (tx_commands, rx_commands) = mpsc::channel(16);
+        let mut session = Self::new(config, channel, rx_commands);
         session.attach_stream(connection);
 
         // fast-forward our FSM
         session.manual_start();
         session.connection_established();
 
-        Ok(session)
+        Ok((session, tx_commands))
     }
 
     pub async fn process(mut self) {
@@ -167,6 +179,16 @@ impl Session {
 
         loop {
             tokio::select! {
+                Some(cmd) = self.commands.recv() => {
+                    match cmd {
+                        Command::Attributes => {
+                            debug!("sending attr");
+                            let _ = self.channel.send(
+                                Message::Attributes(self.attributes)
+                            ).await;
+                        },
+                    }
+                },
                 // message from peer:
                 msg = self.connection.as_mut().unwrap().read_frame() => { // XXX MUT
                     match msg {

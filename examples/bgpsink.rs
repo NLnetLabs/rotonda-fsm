@@ -5,7 +5,7 @@ use clap::Parser;
 use env_logger::Env;
 #[allow(unused_imports)]
 use log::{debug, info, warn, error};
-use rotonda_fsm::bgp::session::{Config, Session as BgpSession, Message};
+use rotonda_fsm::bgp::session::{Command, Config, Session as BgpSession, Message};
 use routecore::bgp::message::{
     update::UpdateMessage,
     notification::NotificationMessage
@@ -61,11 +61,11 @@ impl BgpSpeaker {
             );
             let (tx, rx) = mpsc::channel(100);
             let fh = self.pcap_fh.as_ref().map(|f| f.try_clone().unwrap());
-            if let Ok(session) = BgpSession::try_for_connection(
+            if let Ok((session, tx_commands)) = BgpSession::try_for_connection(
                 config, socket, tx
             ) {
                 tokio::spawn( async move {
-                    let mut p = Processor::new(rx, fh);
+                    let mut p = Processor::new(rx,tx_commands, fh);
                     p.process(session).await;
                 });
             } else {
@@ -77,6 +77,7 @@ impl BgpSpeaker {
 
 struct Processor {
     rx: mpsc::Receiver<Message>,
+    commands: mpsc::Sender<Command>,
     pcap_fh: Option<File>,
 }
 
@@ -113,9 +114,10 @@ impl Processor {
 
     pub(crate) fn new(
         rx: mpsc::Receiver<Message>,
+        commands: mpsc::Sender<Command>,
         pcap_fh: Option<File>,
     ) -> Processor {
-        Processor { rx, pcap_fh }
+        Processor { rx, commands, pcap_fh }
     }
 
     async fn process(
@@ -127,11 +129,27 @@ impl Processor {
             session.process().await;
         });
 
+        let commands2 = self.commands.clone();
+        tokio::spawn(async move {
+            let mut print_stats = tokio::time::interval(
+                std::time::Duration::from_secs(5)
+            );
+            print_stats.tick().await; // ticks immediately
+            loop {
+                print_stats.tick().await;
+                debug!("in process stat interval loop");
+                let cmd = Command::Attributes;
+                let _ = commands2.send(cmd).await;
+            }
+        });
+
         while let Some(msg) = self.rx.recv().await {
             match msg {
                 Message::UpdateMessage(pdu) => self.process_update(pdu),
                 Message::NotificationMessage(pdu) => self.process_notification(pdu),
-                Message::Attributes(_attr) => debug!("got attributes")
+                Message::Attributes(attr) => {
+                    info!("got attributes: state: {:?}", attr.state())
+                }
             }
         }
             
