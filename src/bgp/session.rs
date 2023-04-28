@@ -4,7 +4,7 @@ use std::io::Cursor;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::net::TcpStream;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use log::{debug, error, info, warn};
@@ -42,7 +42,9 @@ pub enum Message {
 
 #[derive(Debug)]
 pub enum Command {
-    Attributes// { resp: oneshot::Sender<SessionAttributes> }
+    GetAttributes { resp: oneshot::Sender<SessionAttributes> },
+    Disconnect,
+    ForcedKeepalive,
 }
 
 #[derive(Debug)]
@@ -57,6 +59,10 @@ impl Connection {
             stream,
             buffer: BytesMut::with_capacity(2^20),
         }
+    }
+
+    async fn disconnect(&mut self) {
+        let _ = self.stream.shutdown().await;
     }
 
     pub async fn read_frame(&mut self)
@@ -144,6 +150,13 @@ impl Session {
     fn attach_stream(&mut self, stream: TcpStream) {
         self.connection = Some(Connection::for_stream(stream));
     }
+    async fn disconnect(&mut self) {
+        debug!("disconnecting from peer addr {}", self.config.remote_addr);
+        if let Some(ref mut c) = self.connection {
+            c.disconnect().await;
+            //self.connection = None;
+        }
+    }
 
     // XXX we need checks on multiple levels:
     // - on the bare tcp stream, is the remote peer in our local config?
@@ -181,12 +194,18 @@ impl Session {
             tokio::select! {
                 Some(cmd) = self.commands.recv() => {
                     match cmd {
-                        Command::Attributes => {
-                            debug!("sending attr");
-                            let _ = self.channel.send(
-                                Message::Attributes(self.attributes)
-                            ).await;
-                        },
+                        Command::GetAttributes{resp} => {
+                            //let _ = self.channel.send(
+                            //    Message::Attributes(self.attributes)
+                            //).await;
+                            let _ = resp.send(self.attributes);
+                        }
+                        Command::Disconnect => {
+                            self.disconnect().await
+                        }
+                        Command::ForcedKeepalive => {
+                            self.send_keepalive()
+                        }
                     }
                 },
                 // message from peer:
@@ -195,9 +214,10 @@ impl Session {
                         Ok(Some(m)) => self.handle_msg(m), // XXX MUT
                         Ok(None) => {
                             warn!(
-                                "[{}] Connection closed by peer",
-                                self.connection.unwrap()
-                                    .stream.peer_addr().unwrap().ip()
+                                "[{}] Connection lost",
+                                self.config.remote_addr
+                                //self.connection.unwrap()
+                                //    .stream.peer_addr().unwrap().ip()
                             );
                             break
                         }
