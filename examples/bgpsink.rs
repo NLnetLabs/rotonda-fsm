@@ -10,6 +10,7 @@ use routecore::bgp::message::{
     update::UpdateMessage,
     notification::NotificationMessage
 };
+use rotonda_fsm::bgp::fsm::{SessionAttributes, State};
 use std::net::IpAddr;
 use tokio::net::TcpListener;
 use tokio::{signal, signal::unix::SignalKind};
@@ -21,6 +22,7 @@ use std::fs::File;
 use std::io::Write;
 
 use std::sync::Arc;
+use std::ops::{Add, AddAssign};
 
 use rotonda_fsm::util::to_pcap;
 
@@ -66,54 +68,63 @@ impl BgpSpeaker {
         }
     }
 
-    async fn run(self, mut cli: CliReceiver) {
-        let listener = TcpListener::bind((self.local_addr, self.local_port)).await.unwrap();
-        info!("listening on {}:{}", self.local_addr, self.local_port);
-        let shared_sessions = self.sessions.clone();
-        let cli_handle = tokio::spawn( async move {
-            'outer: loop {
-                while let Some((cli_cmd, resp_rx)) = cli.recv().await {
-                    if let Some(cmd) = Self::parse_cli(&cli_cmd)  {
-                        //debug!("sending out {cli_cmd} to {} sessions", shared_sessions.len());
-                        match cmd {
-                            CliCommand::Stats => {
-                                let mut responses = vec!();
-                                let shared_sessions = shared_sessions.lock().await;
-                                for s in &*shared_sessions {
-                                    //debug!("sending out ");
-                                    let (tx, rx) = oneshot::channel();
-                                    let to_send = Command::GetAttributes{resp: tx};
-                                    responses.push(rx);
-                                    let _ = s.send(to_send).await;
-                                }
-                                debug!("expecting {} responses", responses.len());
-                                for rx in responses {
-                                    debug!("got response {:?}", rx.await);
-                                }
+    async fn gather_stats(
+        shared_sessions: Arc<Mutex<Vec<mpsc::Sender<Command>>>>
+    ) -> StatsReport {
+        let mut responses = vec!();
+        let shared_sessions = shared_sessions.lock().await;
+        for s in &*shared_sessions {
+            let (tx, rx) = oneshot::channel();
+            let to_send = Command::GetAttributes{resp: tx};
+            responses.push(rx);
+            let _ = s.send(to_send).await;
+        }
+        let mut overall_stats = StatsReport::new();
+        for rx in responses {
+            if let Ok(stats) = rx.await {
+                //debug!("got response {:?}", stats);
+                overall_stats += stats;
+            }
+        }
+        overall_stats
+    }
+
+    async fn read_cli(
+        shared_sessions: Arc<Mutex<Vec<mpsc::Sender<Command>>>>,
+        mut cli: CliReceiver
+    ) {
+        'outer: loop {
+            while let Some((cli_cmd, resp_rx)) = cli.recv().await {
+                if let Some(cmd) = Self::parse_cli(&cli_cmd)  {
+                    match cmd {
+                        CliCommand::Stats => {
+                            let stats = Self::gather_stats(shared_sessions.clone());
+                            info!("{:?}", stats.await);
+                        }
+                        CliCommand::Reconnect => { todo!() }
+                        CliCommand::Exit => {
+                            debug!("got Exit from CLI, emitting Disconnect commands to sessions");
+                            for s in &*shared_sessions.lock().await {
+                                let _ =s.send(Command::Disconnect).await;
                             }
-                            CliCommand::Reconnect => { todo!() }
-                            CliCommand::Exit => {
-                                debug!("got Exit from CLI, emitting Disconnect commands to sessions");
-                                for s in &*shared_sessions.lock().await {
-                                    let _ =s.send(Command::Disconnect).await;
-                                }
-                                break 'outer;
-                            }
-                        };
-                        let _ = resp_rx.send(
-                            format!("got {cli_cmd} in run()!").into()
+                            break 'outer;
+                        }
+                    };
+                    let _ = resp_rx.send(
+                        format!("got {cli_cmd} in run()!").into()
                         );
-                    } else {
-                        println!("unknown command '{cli_cmd}'");
-                    }
+                } else {
+                    println!("unknown command '{cli_cmd}'");
                 }
             }
-            debug!("post loop in run()");
-        });
+        }
+    }
 
+    async fn run(self, cli: CliReceiver) {
+        let listener = TcpListener::bind((self.local_addr, self.local_port)).await.unwrap();
+        info!("listening on {}:{}", self.local_addr, self.local_port);
+        let cli_handle = Self::read_cli(self.sessions.clone(), cli);
 
-        //while !cli_handle.is_finished() {
-        //}
         let accept_handle = tokio::spawn(async move {
             loop {
                 debug!("in loop pre accept()");
@@ -124,6 +135,11 @@ impl BgpSpeaker {
                     self.local_asn.into(),
                     self.bgp_id,
                     remote_ip.ip()
+                );
+
+                let _ = tokio::join!(
+                    socket.writable(),
+                    socket.readable()
                 );
 
                 // tx: sender of PDUs/Stats, moved to Session
@@ -246,6 +262,51 @@ impl Processor {
     }
 }
 
+
+#[derive(Copy, Clone, Debug, Default)]
+struct StatsReport {
+    sessions_established: u32,
+    updates_received: u32,
+}
+
+impl StatsReport {
+    pub fn new() -> Self {
+        StatsReport::default()
+    }
+}
+impl Add for StatsReport {
+    type Output = Self;
+    fn add(self, other: Self) -> Self::Output {
+        Self {
+            sessions_established: self.sessions_established + other.sessions_established,
+            updates_received: self.updates_received + other.updates_received,
+        }
+    }
+}
+impl AddAssign for StatsReport {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
+    }
+}
+impl Add<SessionAttributes> for StatsReport {
+    type Output = Self;
+    fn add(self, other: SessionAttributes) -> Self::Output {
+        Self {
+            sessions_established: match other.state() {
+                State::Established => self.sessions_established + 1,
+                _ => self.sessions_established
+            },
+            ..self
+        }
+    }
+}
+impl AddAssign<SessionAttributes> for StatsReport {
+    fn add_assign(&mut self, other: SessionAttributes) {
+        *self = *self + other;
+    }
+}
+
+
 #[derive(Copy, Clone, Debug)]
 enum CliCommand {
     Stats,
@@ -289,18 +350,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tx2 = tx.clone();
     let cli = tokio::spawn( async move  {
         while !tx2.is_closed() {
-            debug!("in loop for stdin()::read_line");
             let mut buffer = String::new();
             std::io::stdin().read_line(&mut buffer).unwrap();
             let cmd = buffer.trim();
 
             //tx.send(buffer).unwrap();
             if cmd.len() > 0 {
-                debug!("got command from cli: {}", cmd);
                 let (resp_tx, resp_rx) = oneshot::channel();
                 let _ = tx2.send((cmd.to_string(), resp_tx)).await;
                 if let Ok(resp) = resp_rx.await {
-                    debug!("got response: {}", resp);
+                    //debug!("got response: {}", resp);
                 } else {
                     // also triggered when we do not actually process the cli
                     // command, simply because it is not a recognized command

@@ -150,6 +150,7 @@ impl Session {
     fn attach_stream(&mut self, stream: TcpStream) {
         self.connection = Some(Connection::for_stream(stream));
     }
+
     async fn disconnect(&mut self) {
         debug!("disconnecting from peer addr {}", self.config.remote_addr);
         if let Some(ref mut c) = self.connection {
@@ -179,11 +180,13 @@ impl Session {
         session.manual_start();
         session.connection_established();
 
+
         Ok((session, tx_commands))
     }
 
     pub async fn process(mut self) {
         debug!("in Session::process");
+
 
         let mut holdtimer = tokio::time::interval(
             Duration::from_secs(self.hold_time() as u64 / 3)
@@ -232,7 +235,7 @@ impl Session {
                         "[{}] 1/3 holdtimer, sending KEEPALIVE",
                         self.config.remote_addr
                     );
-                    self.send_keepalive();
+                    self.send_keepalive()
                 }
             }
         }
@@ -241,11 +244,13 @@ impl Session {
 
     fn send_raw(&self, raw: Vec<u8>) {
         if self.connection.as_ref().unwrap().stream.try_write(&raw).is_err() {
-            warn!("failed to send_raw, connection borked?")
+            warn!("failed to send_raw, connection borked?");
+            debug!("send_raw buf was: {:?}", &raw);
         }
     }
 
     pub fn send_open(&self) {
+        debug!("in send_open()");
         let mut openbuilder = OpenBuilder::new_vec();
         openbuilder.set_asn(self.config.local_asn);
         openbuilder.set_holdtime(self.attributes.hold_time());
@@ -263,7 +268,7 @@ impl Session {
         // and for our bgpsink, we should copy all the capabilities
         // from the received OPEN
 
-        self.send_raw(openbuilder.finish());
+        let _ = self.send_raw(openbuilder.finish());
     }
 
     pub fn send_keepalive(&self) {
@@ -334,7 +339,7 @@ impl Session {
                self.handle_event(Event::BgpOpen);
            }
            BgpMsg::Keepalive(_m) => {
-               debug!("got KEEPALIVE, generating event");
+               //debug!("got KEEPALIVE, generating event");
                self.handle_event(Event::KeepaliveMsg);
            }
            BgpMsg::Update(m) => {
@@ -853,6 +858,8 @@ impl Session {
                 //- sends a KEEPALIVE message, and
                 // TODO tokio
                 //self.handler.send_raw(KeepaliveBuilder::new_vec().finish());
+                debug!("pre send_keepalive in fsm");
+                debug!("{:?}", self.connection);
                 self.send_keepalive();
 
                 //- sets a KeepaliveTimer:
