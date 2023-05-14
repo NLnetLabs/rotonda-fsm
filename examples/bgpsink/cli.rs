@@ -1,8 +1,10 @@
 use tokio::sync::{mpsc, oneshot};
 
-type CliMessage = (String, oneshot::Sender<String>);
+pub type CliMessage = (String, oneshot::Sender<String>);
 //type CliSender = mpsc::Sender<CliMessage>;
 pub type CliReceiver = mpsc::Receiver<CliMessage>;
+
+// TODO struct Cli or something with the async while loop from main.rs?
 
 #[derive(Copy, Clone, Debug)]
 pub enum CliCommand {

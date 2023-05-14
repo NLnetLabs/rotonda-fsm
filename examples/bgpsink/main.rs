@@ -28,13 +28,13 @@ use rotonda_fsm::util::to_pcap;
 mod cli;
 mod stats;
 
-use cli::{CliCommand, CliReceiver, parse_cli};
+use cli::{CliCommand, CliMessage, CliReceiver, parse_cli};
 use stats::StatsReport;
 
 
 
 struct BgpSpeaker {
-    // to session
+    // channels to session
     sessions: Arc<Mutex<Vec<mpsc::Sender<Command>>>>,
     local_addr: IpAddr,
     local_port: u16,
@@ -97,13 +97,13 @@ impl BgpSpeaker {
                         CliCommand::Exit => {
                             debug!("got Exit from CLI, emitting Disconnect commands to sessions");
                             for s in &*shared_sessions.lock().await {
-                                let _ =s.send(Command::Disconnect).await;
+                                let _  =s.send(Command::Disconnect).await;
                             }
                             break 'outer;
                         }
                     };
                     let _ = resp_rx.send(
-                        format!("got {cli_cmd} in run()!").into()
+                        format!("got {cli_cmd} in run()!")
                         );
                 } else {
                     println!("unknown command '{cli_cmd}'");
@@ -119,43 +119,44 @@ impl BgpSpeaker {
 
         let accept_handle = tokio::spawn(async move {
             loop {
-                debug!("in loop pre accept()");
-            if let Ok((socket, remote_ip)) = listener.accept().await  {
-                info!("BgpSpeaker::run: connection from {}", remote_ip);
+                if let Ok((socket, remote_ip)) = listener.accept().await  {
+                    info!("BgpSpeaker::run: connection from {}", remote_ip);
 
-                let config = Config::new(
-                    self.local_asn.into(),
-                    self.bgp_id,
-                    remote_ip.ip()
-                );
+                    let config = Config::new(
+                        self.local_asn.into(),
+                        self.bgp_id,
+                        remote_ip.ip()
+                    );
 
-                let _ = tokio::join!(
-                    socket.writable(),
-                    socket.readable()
-                );
+                    let socket_status = tokio::join!(
+                        socket.writable(),
+                        socket.readable()
+                    );
 
-                // tx: sender of PDUs/Stats, moved to Session
-                // rx: receive PDUs/Stats from Session 
-                let (tx, rx) = mpsc::channel(100);
-                let fh = self.pcap_fh.as_ref().map(|f| f.try_clone().unwrap());
-                if let Ok((session, tx_commands)) = BgpSession::try_for_connection(
-                    config, socket, tx
-                ) {
-                    let tx_commands_for_speaker = tx_commands.clone();
-                    {
+                    debug!("{:?}", socket_status);
+
+                    // tx: sender of PDUs/Stats, moved to Session
+                    // rx: receive PDUs/Stats from Session 
+                    let (tx, rx) = mpsc::channel::<Message>(100);
+                    let fh = self.pcap_fh.as_ref().map(|f| f.try_clone().unwrap());
+
+                    // returned tx_commands: send commands to Session
+                    if let Ok((session, tx_commands)) = BgpSession::try_for_connection(
+                        config, socket, tx
+                        ) {
+                        let tx_commands_for_speaker = tx_commands.clone();
                         let mut sessions = self.sessions.lock().await;
                         sessions.push(tx_commands_for_speaker);
+                        tokio::spawn( async move {
+                            // rx: receive PDUs/Stats from Session
+                            // tx_commands: send Commands to Session  
+                            let mut p = Processor::new(rx, tx_commands, fh);
+                            p.process(session).await;
+                        });
+                    } else {
+                        error!("Could not set up BGP session");
                     }
-                    tokio::spawn( async move {
-                        // rx: receive PDUs/Stats from Session
-                        // tx_commands: send Commands to Session  
-                        let mut p = Processor::new(rx, tx_commands, fh);
-                        p.process(session).await;
-                    });
-                } else {
-                    error!("Could not set up BGP session");
                 }
-            }
             }
         });
 
@@ -170,7 +171,7 @@ struct Processor {
     // from Session
     rx: mpsc::Receiver<Message>,
     // to session
-    commands: mpsc::Sender<Command>,
+    _commands: mpsc::Sender<Command>,
     pcap_fh: Option<File>,
 }
 
@@ -207,10 +208,10 @@ impl Processor {
 
     pub fn new(
         rx: mpsc::Receiver<Message>,
-        commands: mpsc::Sender<Command>,
+        _commands: mpsc::Sender<Command>,
         pcap_fh: Option<File>,
     ) -> Processor {
-        Processor { rx, commands, pcap_fh }
+        Processor { rx, _commands, pcap_fh }
     }
 
     async fn process(
@@ -221,22 +222,6 @@ impl Processor {
         tokio::spawn(async {
             session.process().await;
         });
-
-        /*
-        let commands2 = self.commands.clone();
-        tokio::spawn(async move {
-            let mut print_stats = tokio::time::interval(
-                std::time::Duration::from_secs(30)
-            );
-            print_stats.tick().await; // ticks immediately
-            loop {
-                print_stats.tick().await;
-                //let _ = commands2.send(Command::Attributes).await;
-                debug!("and forcing keepalive");
-                let _ = commands2.send(Command::ForcedKeepalive).await;
-            }
-        });
-        */
 
         while let Some(msg) = self.rx.recv().await {
             match msg {
@@ -249,8 +234,6 @@ impl Processor {
                 }
             }
         }
-            
-
     }
 }
 
@@ -287,7 +270,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     // process user commands from interactive cli
-    let (tx, rx) = mpsc::channel(4);
+    // TODO move into cli.rs
+    let (tx, rx) = mpsc::channel::<CliMessage>(4);
     let tx2 = tx.clone();
     let cli = tokio::spawn( async move  {
         while !tx2.is_closed() {
@@ -295,11 +279,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::io::stdin().read_line(&mut buffer).unwrap();
             let cmd = buffer.trim();
 
-            //tx.send(buffer).unwrap();
-            if cmd.len() > 0 {
+            if !cmd.is_empty() {
                 let (resp_tx, resp_rx) = oneshot::channel();
                 let _ = tx2.send((cmd.to_string(), resp_tx)).await;
-                if let Ok(resp) = resp_rx.await {
+                if let Ok(_resp) = resp_rx.await {
                     //debug!("got response: {}", resp);
                 } else {
                     // also triggered when we do not actually process the cli
