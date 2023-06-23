@@ -1,5 +1,7 @@
 use log::{debug};
 use std::time::Instant;
+use routecore::bgp::message::OpenMessage;
+use bytes::Bytes;
 
 // The SessionAttributes struct keeps track of all the
 // parameters/counters/values as described in RFC4271. Fields that we
@@ -62,6 +64,9 @@ impl SessionAttributes {
     pub fn hold_time(&self) -> u16 {
         self.hold_time
     }
+    pub fn set_hold_time(&mut self, hold_time: u16) {
+        self.hold_time = hold_time;
+    }
 
     pub fn state(self) -> State {
         self.state
@@ -113,7 +118,7 @@ pub enum State {
     Established,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Event {
     // mandatory
     ManualStart, // 1
@@ -155,7 +160,7 @@ pub enum Event {
 
 
     // mandatory BGP message-based events
-    BgpOpen, // 19
+    BgpOpen(OpenMessage<Bytes>), // 19
 
     BgpHeaderErr, // 21
     BgpOpenMsgErr, // 22

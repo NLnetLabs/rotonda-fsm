@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::io::Cursor;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -15,11 +15,13 @@ use routecore::bgp::message::{
     SessionConfig,
     UpdateMessage,
 };
-use routecore::bgp::message::open::Capability;
-use routecore::bgp::message::keepalive::KeepaliveBuilder;
-use routecore::bgp::message::open::OpenBuilder;
-use routecore::bgp::types::{AFI, SAFI};
 use routecore::bgp::ParseError;
+use routecore::bgp::message::keepalive::KeepaliveBuilder;
+use routecore::bgp::message::notification::{
+    NotificationBuilder, CeaseSubcode, Details, OpenMessageSubcode
+};
+use routecore::bgp::message::open::{Capability, OpenBuilder};
+use routecore::bgp::types::{AFI, SAFI};
 
 use crate::bgp::fsm::{Event, SessionAttributes, State};
 #[allow(unused_imports)]
@@ -27,9 +29,10 @@ use crate::util::to_pcap;
 
 #[derive(Debug)]
 pub struct Session {
-    config: Config,
+    pub config: LocalConfig,
     attributes: SessionAttributes, // contains the actual FSM
-    connection: Option<Connection>,
+    //connection: Option<Connection>,
+    connection: Connection,
     channel: mpsc::Sender<Message>,
     commands: mpsc::Receiver<Command>,
 }
@@ -38,15 +41,28 @@ pub enum Message {
     UpdateMessage(UpdateMessage<Bytes>),
     NotificationMessage(NotificationMessage<Bytes>),
     Attributes(SessionAttributes),
+    ConnectionLost,
 }
 
 #[derive(Debug)]
 pub enum Command {
     GetAttributes { resp: oneshot::Sender<SessionAttributes> },
-    Disconnect,
+    Disconnect(DisconnectReason),
     ForcedKeepalive,
 }
 
+#[derive(Debug)]
+pub enum DisconnectReason {
+    Reconfiguration,
+    Deconfigured,
+    Shutdown,
+    FsmViolation(Option<Details>),
+    Other,
+}
+
+/// TCP-level connection carrying the BGP session.
+///
+///
 #[derive(Debug)]
 pub struct Connection {
     stream: TcpStream,
@@ -106,25 +122,44 @@ impl Connection {
 
 
 /// Local configuration of BGP session.
-#[derive(Debug)]
-pub struct Config {
+///
+/// This holds all the information needed to setup a BGP session with a remote
+/// peer. Such information comes from local configuration.
+/// Note that we keep the `remote_addr` here in forms of an `IpAddr`, that
+/// SHOULD match the IP address of the `SocketAddr` of the `TcpStream` in the
+/// associated `Connection`.
+/// **NB**: this is, as of now, different from the `SessionConfig` used to
+/// parse BGP (UPDATE) PDUs.
+///
+/// XXX the `capabilities` here are the ones locally configured, _not_ the
+/// ones actually agreed upon with the remote peer. We need to figure out
+/// where to keep those.
+/// XXX LocalConfig will likely overlap much with how we deserialize the
+/// runtime.conf (for the time being)
+#[derive(Clone, Debug)]
+pub struct LocalConfig {
     local_asn: Asn,
     bgp_id: [u8; 4],
-    _remote_asn: Option<Asn>,
-    remote_addr: IpAddr,
+    pub remote_asn: Option<Asn>,
+    pub remote_addr: IpAddr,
+    pub hold_time: Option<u16>,
     capabilities: Vec<Capability<Vec<u8>>>,
 }
-impl Config {
+
+impl LocalConfig {
     pub fn new(
         local_asn: Asn,
         bgp_id: [u8; 4],
-        remote_addr: IpAddr
-    ) -> Config {
+        remote_addr: IpAddr,
+        remote_asn: Option<Asn>,
+        hold_time: Option<u16>,
+    ) -> LocalConfig {
         Self {
             local_asn,
             bgp_id,
-            _remote_asn: None,
+            remote_asn,
             remote_addr,
+            hold_time,
             capabilities: vec!()
         }
     }
@@ -132,31 +167,75 @@ impl Config {
 
 impl Session {
     pub fn new(
-        config: Config,
+        config: LocalConfig,
+        stream: TcpStream,
         channel: mpsc::Sender<Message>,
         commands: mpsc::Receiver<Command>,
         )
         -> Self
     {
-        Self {
+        let mut session = Self {
             config,
             attributes: SessionAttributes::default(),
-            connection: None,
+            connection: Connection::for_stream(stream),
             channel,
             commands,
+        };
+        // set optional configuration
+        if let Some(hold_time) = session.config.hold_time {
+            session.set_hold_time(hold_time);
         }
+
+        session
     }
 
-    fn attach_stream(&mut self, stream: TcpStream) {
-        self.connection = Some(Connection::for_stream(stream));
+    pub fn details(&self) -> (Option<SocketAddr>, Option<Asn>) {
+        //(self.connection.as_ref().and_then(|c| c.stream.peer_addr().ok()), self.config.remote_asn)
+        (self.connection.stream.peer_addr().ok(), self.config.remote_asn)
     }
 
-    async fn disconnect(&mut self) {
-        debug!("disconnecting from peer addr {}", self.config.remote_addr);
-        if let Some(ref mut c) = self.connection {
+    //fn attach_stream(&mut self, stream: TcpStream) {
+    //    self.connection = Some(Connection::for_stream(stream));
+    //}
+
+    async fn disconnect(&mut self, reason: DisconnectReason) {
+        match reason {
+            DisconnectReason::Reconfiguration => {
+                self.send_notification(
+                    Details::Cease(CeaseSubcode::OtherConfigurationChange)
+                )
+            }
+            DisconnectReason::Deconfigured => {
+                self.send_notification(
+                    Details::Cease(CeaseSubcode::PeerDeconfigured)
+                )
+            }
+            DisconnectReason::Shutdown => {
+                self.send_notification(
+                    Details::Cease(CeaseSubcode::AdministrativeShutdown)
+                )
+            }
+            DisconnectReason::FsmViolation(maybe_notification) => {
+                if let Some(details) = maybe_notification {
+                    self.send_notification(details)
+                }
+            }
+            DisconnectReason::Other => {
+                todo!();
+            }
+        }
+        debug!(
+            "disconnecting from peer addr {}: {:?}",
+            self.config.remote_addr, reason,
+        );
+
+        /*
+        if let Some(ref mut c) = self.connection.take() {
             c.disconnect().await;
             //self.connection = None;
         }
+        */
+        self.connection.disconnect().await;
     }
 
     // XXX we need checks on multiple levels:
@@ -164,21 +243,28 @@ impl Session {
     // - in the BGP OPEN, is the remote AS in our local config?
     // - after exchanging OPENs, do we end up with something sound?
     // perhaps we should make Session generic over a marker::PhantomData
-    pub fn try_for_connection(
-        config: Config,
+    // XXX we might want to build a collection (HashMap?) of
+    // remote_addr => Configs items, where we can quickly check for which IP
+    // address we actually have local config. If not, we should not set up a
+    // connection anyway. If we do establish a connection, we should/could
+    // keep it in that same collection?  
+    // But perhaps that collection thing should live in the application using
+    // this lib.
+    pub async fn try_for_connection(
+        config: LocalConfig,
         connection: TcpStream,
         channel: mpsc::Sender<Message>
     ) -> Result<(Self, mpsc::Sender<Command>), ConnectionError> {
         if connection.peer_addr()?.ip() != config.remote_addr {
-            return Err(ConnectionError)
+            return Err(UnexpectedPeer(connection.peer_addr()?.ip()))?
         }
         let (tx_commands, rx_commands) = mpsc::channel(16);
-        let mut session = Self::new(config, channel, rx_commands);
-        session.attach_stream(connection);
+        let mut session = Self::new(config, connection, channel, rx_commands);
+        //session.attach_stream(connection);
 
         // fast-forward our FSM
-        session.manual_start();
-        session.connection_established();
+        session.manual_start().await;
+        session.connection_established().await;
 
 
         Ok((session, tx_commands))
@@ -203,8 +289,9 @@ impl Session {
                             //).await;
                             let _ = resp.send(self.attributes);
                         }
-                        Command::Disconnect => {
-                            self.disconnect().await
+                        Command::Disconnect(reason) => {
+                            self.disconnect(reason).await;
+                            break
                         }
                         Command::ForcedKeepalive => {
                             self.send_keepalive()
@@ -212,16 +299,23 @@ impl Session {
                     }
                 },
                 // message from peer:
-                msg = self.connection.as_mut().unwrap().read_frame() => { // XXX MUT
+                msg = self.connection.read_frame() => {
                     match msg {
-                        Ok(Some(m)) => self.handle_msg(m), // XXX MUT
+                        Ok(Some(m)) => {
+                            if let Err(msg) = self.handle_msg(m).await {
+                                debug!("handle_msg returned err: {msg}, break");
+                                break;
+                            }
+                        }
                         Ok(None) => {
                             warn!(
                                 "[{}] Connection lost",
                                 self.config.remote_addr
-                                //self.connection.unwrap()
-                                //    .stream.peer_addr().unwrap().ip()
                             );
+                            let _ = self.channel.send(
+                                Message::ConnectionLost
+                            ).await;
+
                             break
                         }
                         Err(e) => {
@@ -242,9 +336,16 @@ impl Session {
     }
 
 
+    // XXX this surely MUST be async?
     fn send_raw(&self, raw: Vec<u8>) {
-        if self.connection.as_ref().unwrap().stream.try_write(&raw).is_err() {
-            warn!("failed to send_raw, connection borked?");
+        //if self.connection.as_ref().unwrap().stream.try_write(&raw).is_err() {
+        if self.connection.stream.try_write(&raw).is_err() {
+            warn!(
+                "[{:?}@{}] failed to send_raw, connection borked?",
+                //self.connection.as_ref().unwrap().stream.peer_addr().unwrap()
+                self.config.remote_asn,
+                self.config.remote_addr
+            );
             debug!("send_raw buf was: {:?}", &raw);
         }
     }
@@ -271,6 +372,14 @@ impl Session {
         let _ = self.send_raw(openbuilder.finish());
     }
 
+    pub fn send_notification(&self, details: Details) {
+        debug!("in send_notification()");
+        let notification = NotificationBuilder::new_vec::<Vec<u8>>(
+            details, None,
+        ).expect("TODO");
+        let _ = self.send_raw(notification);
+    }
+
     pub fn send_keepalive(&self) {
         self.send_raw(KeepaliveBuilder::new_vec().finish());
     }
@@ -287,9 +396,9 @@ impl Session {
         self.attributes().hold_time()
     }
 
-    //pub fn set_hold_time(&mut self, time: u16) {
-    //    self.attributes_mut().hold_time = time;
-    //}
+    pub fn set_hold_time(&mut self, time: u16) {
+        self.attributes_mut().set_hold_time(time);
+    }
 
     fn attributes_mut(&mut self) -> &mut SessionAttributes {
         &mut self.attributes
@@ -324,48 +433,50 @@ impl Session {
     }
 
     //--- event functions ----------------------------------------------------
-    pub fn manual_start(&mut self) {
-        self.handle_event(Event::ManualStart);
+    pub async fn manual_start(&mut self) {
+        let _ = self.handle_event(Event::ManualStart).await;
     }
 
-    pub fn connection_established(&mut self) {
-        self.handle_event(Event::TcpConnectionConfirmed);
+    pub async fn connection_established(&mut self) {
+        let _ = self.handle_event(Event::TcpConnectionConfirmed).await;
     }
 
-    pub fn handle_msg(&mut self, msg: BgpMsg<Bytes>) {
+    pub async fn handle_msg(&mut self, msg: BgpMsg<Bytes>) -> Result<(), Error> {
        match msg {
            BgpMsg::Open(m) => {
                debug!("got OPEN from {}, generating event", m.my_asn());
-               self.handle_event(Event::BgpOpen);
+               self.handle_event(Event::BgpOpen(m)).await?;
            }
            BgpMsg::Keepalive(_m) => {
-               //debug!("got KEEPALIVE, generating event");
-               self.handle_event(Event::KeepaliveMsg);
+               debug!("got KEEPALIVE, generating event");
+               self.handle_event(Event::KeepaliveMsg).await?;
            }
            BgpMsg::Update(m) => {
                debug!("got UPDATE");
-               self.handle_event(Event::UpdateMsg);
+               self.handle_event(Event::UpdateMsg).await?;
                let tx = self.channel.clone();
-               tokio::spawn(async move {
-                   tx.send(Message::UpdateMessage(m)).await
-               });
+               //tokio::spawn(async move {
+                   let _ = tx.send(Message::UpdateMessage(m)).await;
+               //});
            }
            BgpMsg::Notification(m) => {
                debug!("got NOTIFICATION");
+               println!("{}", to_pcap(&m));
                //self.handle_event(Event::UpdateMsg);
                let tx = self.channel.clone();
-               tokio::spawn(async move {
-                   tx.send(Message::NotificationMessage(m)).await
-               });
+               //tokio::spawn(async move {
+                   let _ = tx.send(Message::NotificationMessage(m)).await;
+               //});
            }
        }
+       Ok(())
     }
 
     // state machine transitions
-    fn handle_event(&mut self, event: Event) {
+    async fn handle_event(&mut self, event: Event) -> Result<(), Error> {
         use State as S;
         use Event as E;
-        match (self.state(), event) {
+        match (self.state(), &event) {
             //--- Idle -------------------------------------------------------
             (S::Idle, E::ManualStart) => {
 
@@ -410,7 +521,7 @@ impl Session {
                 E::TcpCrAcked |
                 E::TcpConnectionConfirmed |
                 E::TcpConnectionFails |
-                E::BgpOpen |
+                E::BgpOpen(_) |
                 //E::BgpOpenWithDelayOpenTimerRunning |
                 E::BgpHeaderErr |
                 E::BgpOpenMsgErr |
@@ -530,7 +641,7 @@ impl Session {
                 E::HoldTimerExpires |
                 E::KeepaliveTimerExpires |
                 //E::IdleHoldTimerExpires |
-                E::BgpOpen |
+                E::BgpOpen(_) |
                 //E::OpenCollisionDump |
                 E::NotifMsg |
                 E::KeepaliveMsg |
@@ -733,12 +844,17 @@ impl Session {
                 }
             }
 
+            // TODO S::Active, E::BgpOpen handling depends on whether
+            // delayopen is implemented and running
+            // which technically means we act on
+            // (S::Active, E::BgpOpenWithDelayOpenTimerRunning)
+
             (S::Active, 
                 //E::AutomaticStop |
                 E::HoldTimerExpires |
                 E::KeepaliveTimerExpires |
                 //E::IdleHoldTimerExpires |
-                E::BgpOpen |
+                E::BgpOpen(_) |
                 //E::OpenCollisionDump |
                 E::NotifMsg |
                 E::KeepaliveMsg |
@@ -848,12 +964,52 @@ impl Session {
                 //- changes its state to Active.
                 self.set_state(State::Active);
             }
-            (S::OpenSent, E::BgpOpen) => {
+            (S::OpenSent, E::BgpOpen(open_msg)) => {
                 //- resets the DelayOpenTimer to zero,
                 // TODO once DelayOpenTimer is implemented
 
                 //- sets the BGP ConnectRetryTimer to zero,
                 self.start_connect_retry_timer();
+
+                // TODO XXX check the contents of the received OPEN
+                // - expected remote ASN?
+                // - extract and store capabilities:
+                //      we know what we are capable of ourselves
+                //      determine the intersection of that
+                //      that will make up our SessionConfig or whatever we'll
+                //      rename it to
+                // - check all other possible subcodes in Notification
+
+        // rfc4271, if the received OPEN is not correct, then:
+        //- (optionally) sends a NOTIFICATION message with the appropriate
+        //  error code if the SendNOTIFICATIONwithoutOPEN attribute is set
+        //  to TRUE,
+
+        //- sets the ConnectRetryTimer to zero,
+
+        //- releases all BGP resources,
+
+        //- drops the TCP connection,
+
+        //- increments the ConnectRetryCounter by 1,
+
+        //- (optionally) performs peer oscillation damping if the
+        //  DampPeerOscillations attribute is set to TRUE, and
+
+        //- changes its state to Idle.
+
+                if let Some(remote_asn) = self.config.remote_asn {
+                    if remote_asn != open_msg.my_asn() {
+                        warn!("Expected {}, got {} in OPEN", remote_asn, open_msg.my_asn());
+                        self.disconnect(DisconnectReason::FsmViolation(Some(
+                                    Details::OpenMessageError(OpenMessageSubcode::BadPeerAs)
+                        ))).await;
+                        self.set_state(State::Idle);
+                        return Err(Error { msg: "stop processing" })
+                    }
+                } else {
+                    warn!("No remote ASN configured for this peer, accepting")
+                }
 
                 //- sends a KEEPALIVE message, and
                 // TODO tokio
@@ -1062,7 +1218,7 @@ impl Session {
                 //- changes its state to Idle.
                 self.set_state(State::Idle);
             }
-            (S::OpenConfirm, E::BgpOpen) => {
+            (S::OpenConfirm, E::BgpOpen(_)) => {
                 // If the local system receives a valid OPEN message (BGPOpen
                 // (Event 19)), the collision detect function is processed per
                 //    Section 6.8.  If this connection is to be dropped due to
@@ -1229,7 +1385,7 @@ impl Session {
                 // successfully established (Event 16 or Event 17), the second
                 // connection SHALL be tracked until it sends an OPEN message.
             }
-            (S::Established, E::BgpOpen) => {
+            (S::Established, E::BgpOpen(_)) => {
                 todo!()
                 // once CollisionDetectEstablishedState is implemented, things
                 // need to happen here
@@ -1337,6 +1493,7 @@ impl Session {
                 self.set_state(State::Idle);
             }
         }
+        Ok(())
     }
 }
 
@@ -1344,18 +1501,34 @@ impl Session {
 
 use std::fmt;
 #[derive(Debug)]
-pub struct ConnectionError;
+pub struct ConnectionError(String);
 impl std::error::Error for ConnectionError { }
 impl fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("connection failed")
+        write!(f, "Connection error: {}", self.0)
     }
 }
 impl From<std::io::Error> for ConnectionError {
-    fn from(_: std::io::Error) -> Self {
-        ConnectionError
+    fn from(e: std::io::Error) -> Self {
+        ConnectionError(format!("Connection io error: {}", e))
     }
 }
+
+#[derive(Debug)]
+pub struct UnexpectedPeer(IpAddr);
+impl std::error::Error for UnexpectedPeer { }
+impl fmt::Display for UnexpectedPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unexpected peer {}", self.0)
+    }
+}
+impl From<UnexpectedPeer> for ConnectionError {
+    fn from(e: UnexpectedPeer) -> Self {
+        ConnectionError(e.to_string())
+    }
+}
+
+
 
 pub struct Error {
     msg: &'static str,
