@@ -202,17 +202,17 @@ impl Session {
         match reason {
             DisconnectReason::Reconfiguration => {
                 self.send_notification(
-                    Details::Cease(CeaseSubcode::OtherConfigurationChange)
+                    CeaseSubcode::OtherConfigurationChange
                 )
             }
             DisconnectReason::Deconfigured => {
                 self.send_notification(
-                    Details::Cease(CeaseSubcode::PeerDeconfigured)
+                    CeaseSubcode::PeerDeconfigured
                 )
             }
             DisconnectReason::Shutdown => {
                 self.send_notification(
-                    Details::Cease(CeaseSubcode::AdministrativeShutdown)
+                    CeaseSubcode::AdministrativeShutdown
                 )
             }
             DisconnectReason::FsmViolation(maybe_notification) => {
@@ -325,10 +325,6 @@ impl Session {
                     }
                 },
                 _ = holdtimer.tick() => {
-                    debug!(
-                        "[{}] 1/3 holdtimer, sending KEEPALIVE",
-                        self.config.remote_addr
-                    );
                     self.send_keepalive()
                 }
             }
@@ -351,7 +347,6 @@ impl Session {
     }
 
     pub fn send_open(&self) {
-        debug!("in send_open()");
         let mut openbuilder = OpenBuilder::new_vec();
         openbuilder.set_asn(self.config.local_asn);
         openbuilder.set_holdtime(self.attributes.hold_time());
@@ -372,12 +367,23 @@ impl Session {
         let _ = self.send_raw(openbuilder.finish());
     }
 
-    pub fn send_notification(&self, details: Details) {
-        debug!("in send_notification()");
-        let notification = NotificationBuilder::new_vec::<Vec<u8>>(
-            details, None,
-        ).expect("TODO");
-        let _ = self.send_raw(notification);
+    pub fn send_notification<S>(&self, subcode: S)
+        where
+        //D: AsRef<[u8]>,
+        S: Into<Details>
+    {
+        /*
+        let notification = if let Some(data) = data {
+            NotificationBuilder::new_vec(subcode, Some(data)).unwrap_or_else(|_| {
+                error!("Failed to construct Notification PDU");
+            }
+                )
+        } else {
+          NotificationBuilder::new_vec_nodata(subcode)
+        };
+        */
+        let msg = NotificationBuilder::new_vec_nodata(subcode);
+        let _ = self.send_raw(msg);
     }
 
     pub fn send_keepalive(&self) {
@@ -448,25 +454,20 @@ impl Session {
                self.handle_event(Event::BgpOpen(m)).await?;
            }
            BgpMsg::Keepalive(_m) => {
-               debug!("got KEEPALIVE, generating event");
                self.handle_event(Event::KeepaliveMsg).await?;
            }
            BgpMsg::Update(m) => {
                debug!("got UPDATE");
                self.handle_event(Event::UpdateMsg).await?;
                let tx = self.channel.clone();
-               //tokio::spawn(async move {
-                   let _ = tx.send(Message::UpdateMessage(m)).await;
-               //});
+                let _ = tx.send(Message::UpdateMessage(m)).await;
            }
            BgpMsg::Notification(m) => {
                debug!("got NOTIFICATION");
                println!("{}", to_pcap(&m));
                //self.handle_event(Event::UpdateMsg);
                let tx = self.channel.clone();
-               //tokio::spawn(async move {
-                   let _ = tx.send(Message::NotificationMessage(m)).await;
-               //});
+                let _ = tx.send(Message::NotificationMessage(m)).await;
            }
        }
        Ok(())
@@ -591,12 +592,6 @@ impl Session {
                     //  TODO (do we need to do something here?)
 
                     //  - sends an OPEN message to its peer,
-                    //let to_send = self.handler.send_open(
-                    //    //&self,
-                    //    //self.local_asn,
-                    //    //self.attributes().hold_time,
-                    //    //self.bgp_id,
-                    //);
                     self.send_open();
 
 
@@ -1002,7 +997,7 @@ impl Session {
                     if remote_asn != open_msg.my_asn() {
                         warn!("Expected {}, got {} in OPEN", remote_asn, open_msg.my_asn());
                         self.disconnect(DisconnectReason::FsmViolation(Some(
-                                    Details::OpenMessageError(OpenMessageSubcode::BadPeerAs)
+                                    OpenMessageSubcode::BadPeerAs.into()
                         ))).await;
                         self.set_state(State::Idle);
                         return Err(Error { msg: "stop processing" })
@@ -1014,8 +1009,6 @@ impl Session {
                 //- sends a KEEPALIVE message, and
                 // TODO tokio
                 //self.handler.send_raw(KeepaliveBuilder::new_vec().finish());
-                debug!("pre send_keepalive in fsm");
-                debug!("{:?}", self.connection);
                 self.send_keepalive();
 
                 //- sets a KeepaliveTimer:
