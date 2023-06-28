@@ -3,6 +3,7 @@ use std::time::Instant;
 use routecore::bgp::message::OpenMessage;
 use bytes::Bytes;
 
+
 // The SessionAttributes struct keeps track of all the
 // parameters/counters/values as described in RFC4271. Fields that we
 // introduce ourselves, e.g. the _tick fields to keep track of timers, carry
@@ -102,8 +103,8 @@ impl Default for SessionAttributes {
             connect_retry_last_tick: None,
             hold_timer: 90,
             hold_time: 90,
-            keepalive_timer: 180,
-            keepalive_time: 180,
+            keepalive_timer: 30,
+            keepalive_time: 30,
         }
     }
 }

@@ -23,10 +23,12 @@ use routecore::bgp::message::notification::{
 use routecore::bgp::message::open::{Capability, OpenBuilder};
 use routecore::bgp::types::{AFI, SAFI};
 
+use crate::bgp::timers::Timer;
 use crate::bgp::fsm::{Event, SessionAttributes, State};
 #[allow(unused_imports)]
 use crate::util::to_pcap;
 
+// XXX should AgreedConfig go in here?
 #[derive(Debug)]
 pub struct Session {
     pub config: LocalConfig,
@@ -35,8 +37,12 @@ pub struct Session {
     connection: Connection,
     channel: mpsc::Sender<Message>,
     commands: mpsc::Receiver<Command>,
+
+    hold_timer: Timer,
+    keepalive_timer: Timer,
 }
 
+/// Messages sent to user of this Session.
 pub enum Message {
     UpdateMessage(UpdateMessage<Bytes>),
     NotificationMessage(NotificationMessage<Bytes>),
@@ -44,6 +50,7 @@ pub enum Message {
     ConnectionLost,
 }
 
+/// Commands sent from user to this Session.
 #[derive(Debug)]
 pub enum Command {
     GetAttributes { resp: oneshot::Sender<SessionAttributes> },
@@ -55,6 +62,7 @@ pub enum Command {
 pub enum DisconnectReason {
     Reconfiguration,
     Deconfigured,
+    HoldTimerExpired,
     Shutdown,
     FsmViolation(Option<Details>),
     Other,
@@ -99,6 +107,9 @@ impl Connection {
     }
 
 
+    // XXX maybe turn this into a take_frame
+    // and do the parsing withing the FSM so we can send the correct
+    // NOTIFICATIONs etc?
     fn parse_frame(&mut self) -> Result<Option<BgpMsg<Bytes>>, ParseError> {
         let mut buf = Cursor::new(&self.buffer[..]);
 
@@ -140,7 +151,7 @@ impl Connection {
 pub struct LocalConfig {
     local_asn: Asn,
     bgp_id: [u8; 4],
-    pub remote_asn: Option<Asn>,
+    pub remote_asn: Asn,
     pub remote_addr: IpAddr,
     pub hold_time: Option<u16>,
     capabilities: Vec<Capability<Vec<u8>>>,
@@ -151,7 +162,7 @@ impl LocalConfig {
         local_asn: Asn,
         bgp_id: [u8; 4],
         remote_addr: IpAddr,
-        remote_asn: Option<Asn>,
+        remote_asn: Asn,
         hold_time: Option<u16>,
     ) -> LocalConfig {
         Self {
@@ -160,10 +171,25 @@ impl LocalConfig {
             remote_asn,
             remote_addr,
             hold_time,
-            capabilities: vec!()
+            capabilities: vec!(),
         }
     }
 }
+
+/*
+// XXX this should become the actual SessionConfig
+// and SessionConfig should be renamed to ParseInfo or something.
+pub struct AgreedConfig {
+    capabilities: Vec<Capability<Vec<u8>>,
+    hold_time, other timers, 
+    remote bgp_Id, 
+    remote port? that's in Session::connection
+
+
+}
+*/
+
+
 
 impl Session {
     pub fn new(
@@ -174,22 +200,35 @@ impl Session {
         )
         -> Self
     {
+        let mut hold_timer = Timer::new(10);
+        let mut keepalive_timer = Timer::new(4);
+        // XXX these should actually be started at specific points in the FSM
+        // but we start 'm now just to test their workings.
+        hold_timer.start();
+        keepalive_timer.start();
+
         let mut session = Self {
             config,
             attributes: SessionAttributes::default(),
             connection: Connection::for_stream(stream),
             channel,
             commands,
+            hold_timer,
+            keepalive_timer,
         };
+
+        session.set_hold_time(10);
+
         // set optional configuration
-        if let Some(hold_time) = session.config.hold_time {
-            session.set_hold_time(hold_time);
-        }
+        // XXX this should go in favour of the new timers
+        //if let Some(hold_time) = session.config.hold_time {
+        //    session.set_hold_time(hold_time);
+        //}
 
         session
     }
 
-    pub fn details(&self) -> (Option<SocketAddr>, Option<Asn>) {
+    pub fn details(&self) -> (Option<SocketAddr>, Asn) {
         //(self.connection.as_ref().and_then(|c| c.stream.peer_addr().ok()), self.config.remote_asn)
         (self.connection.stream.peer_addr().ok(), self.config.remote_asn)
     }
@@ -209,6 +248,9 @@ impl Session {
                 self.send_notification(
                     CeaseSubcode::PeerDeconfigured
                 )
+            }
+            DisconnectReason::HoldTimerExpired => {
+                self.send_notification(Details::HoldTimerExpired)
             }
             DisconnectReason::Shutdown => {
                 self.send_notification(
@@ -270,79 +312,94 @@ impl Session {
         Ok((session, tx_commands))
     }
 
-    pub async fn process(mut self) {
-        debug!("in Session::process");
 
-
-        let mut holdtimer = tokio::time::interval(
-            Duration::from_secs(self.hold_time() as u64 / 3)
-        );
-        holdtimer.tick().await; // ticks immediately
-
-        loop {
-            tokio::select! {
-                Some(cmd) = self.commands.recv() => {
-                    match cmd {
-                        Command::GetAttributes{resp} => {
-                            //let _ = self.channel.send(
-                            //    Message::Attributes(self.attributes)
-                            //).await;
-                            let _ = resp.send(self.attributes);
-                        }
-                        Command::Disconnect(reason) => {
-                            self.disconnect(reason).await;
-                            break
-                        }
-                        Command::ForcedKeepalive => {
-                            self.send_keepalive()
-                        }
+    /// Process the next event.
+    ///
+    /// Note that this takes a mutable reference so the caller keeps ownership
+    /// of the Session.
+    pub async fn tick(&mut self) -> Result<(), Error> {
+        tokio::select! {
+            // command from application:
+            Some(cmd) = self.commands.recv() => {
+                match cmd {
+                    Command::GetAttributes{resp} => {
+                        let _ = resp.send(self.attributes);
                     }
-                },
-                // message from peer:
-                msg = self.connection.read_frame() => {
-                    match msg {
-                        Ok(Some(m)) => {
-                            if let Err(msg) = self.handle_msg(m).await {
-                                debug!("handle_msg returned err: {msg}, break");
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            warn!(
-                                "[{}] Connection lost",
-                                self.config.remote_addr
-                            );
-                            let _ = self.channel.send(
-                                Message::ConnectionLost
-                            ).await;
-
-                            break
-                        }
-                        Err(e) => {
-                            error!("{e}");
-                            break
-                        }
+                    Command::Disconnect(reason) => {
+                        self.disconnect(reason).await;
+                        return Err(Error { msg: "disconnected via Command" });
                     }
-                },
-                _ = holdtimer.tick() => {
-                    self.send_keepalive()
+                    Command::ForcedKeepalive => {
+                        self.send_keepalive()
+                    }
                 }
             }
+            // message from peer:
+            msg = self.connection.read_frame() => {
+                match msg {
+                    Ok(Some(m)) => {
+                        if let Err(msg) = self.handle_msg(m).await {
+                            debug!("handle_msg returned err: {msg}, break");
+                            return Err(Error { msg: "handle_msg failed" });
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "[{}] Connection lost",
+                            self.config.remote_addr
+                            );
+                        let _ = self.channel.send(
+                            Message::ConnectionLost
+                            ).await;
+
+                        return Err(Error { msg: "connection lost" });
+                    }
+                    Err(e) => {
+                        error!("{e}");
+                        return Err(Error { msg: "error from read_frame" });
+                    }
+                }
+            }
+            // Timers expiring:
+            _ = self.keepalive_timer.tick() => {
+                //debug!("keepalive_timer tick'd, sending KEEPALIVE");
+                self.send_keepalive()
+            }
+            _ = self.hold_timer.tick() => {
+                //debug!("Hold time expired, disconnecting");
+                self.disconnect(DisconnectReason::HoldTimerExpired).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Process all future events. 
+    ///
+    /// This takes ownership of the Session. So, while the caller only needs
+    /// to call this once, e.g. like
+    ///
+    /// ```
+    ///     tokio::spawn(async {
+    ///         session.process().await;
+    ///     });
+    /// ```
+    /// other possibilities to interact with the Session is lost.
+    /// If fine grained control is required, use [`Session::tick`].
+    pub async fn process(mut self) -> Result<(), Error>{
+        loop {
+            self.tick().await?;
         }
     }
 
 
-    // XXX this surely MUST be async?
     fn send_raw(&self, raw: Vec<u8>) {
-        //if self.connection.as_ref().unwrap().stream.try_write(&raw).is_err() {
         if self.connection.stream.try_write(&raw).is_err() {
             warn!(
                 "[{:?}@{}] failed to send_raw, connection borked?",
-                //self.connection.as_ref().unwrap().stream.peer_addr().unwrap()
                 self.config.remote_asn,
                 self.config.remote_addr
             );
-            debug!("send_raw buf was: {:?}", &raw);
+            debug!("failed send_raw buf was: {:?}", &raw);
         }
     }
 
@@ -463,13 +520,11 @@ impl Session {
                 let _ = tx.send(Message::UpdateMessage(m)).await;
            }
            BgpMsg::Notification(m) => {
-               debug!("got NOTIFICATION");
-               println!("{}", to_pcap(&m));
-               //self.handle_event(Event::UpdateMsg);
                let tx = self.channel.clone();
-                let _ = tx.send(Message::NotificationMessage(m)).await;
+               let _ = tx.send(Message::NotificationMessage(m)).await;
            }
        }
+       self.hold_timer.reset();
        Ok(())
     }
 
@@ -993,17 +1048,17 @@ impl Session {
 
         //- changes its state to Idle.
 
-                if let Some(remote_asn) = self.config.remote_asn {
-                    if remote_asn != open_msg.my_asn() {
-                        warn!("Expected {}, got {} in OPEN", remote_asn, open_msg.my_asn());
-                        self.disconnect(DisconnectReason::FsmViolation(Some(
-                                    OpenMessageSubcode::BadPeerAs.into()
-                        ))).await;
-                        self.set_state(State::Idle);
-                        return Err(Error { msg: "stop processing" })
-                    }
-                } else {
-                    warn!("No remote ASN configured for this peer, accepting")
+                if self.config.remote_asn != open_msg.my_asn() {
+                    warn!(
+                        "Expected {}, got {} in OPEN",
+                        self.config.remote_asn,
+                        open_msg.my_asn()
+                    );
+                    self.disconnect(DisconnectReason::FsmViolation(Some(
+                                OpenMessageSubcode::BadPeerAs.into()
+                                ))).await;
+                    self.set_state(State::Idle);
+                    return Err(Error { msg: "stop processing" })
                 }
 
                 //- sends a KEEPALIVE message, and
