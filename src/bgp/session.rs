@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::net::{IpAddr, SocketAddr};
 use std::io::Cursor;
 
@@ -200,36 +200,23 @@ impl Session {
         )
         -> Self
     {
-        let mut hold_timer = Timer::new(10);
-        let mut keepalive_timer = Timer::new(4);
-        // XXX these should actually be started at specific points in the FSM
-        // but we start 'm now just to test their workings.
-        hold_timer.start();
-        keepalive_timer.start();
+        let mut attributes = SessionAttributes::default();
+        if let Some(hold_time) = config.hold_time {
+            attributes.set_hold_time(hold_time);
+        }
 
-        let mut session = Self {
+        Self {
             config,
-            attributes: SessionAttributes::default(),
+            attributes,
             connection: Connection::for_stream(stream),
             channel,
             commands,
-            hold_timer,
-            keepalive_timer,
-        };
-
-        session.set_hold_time(10);
-
-        // set optional configuration
-        // XXX this should go in favour of the new timers
-        //if let Some(hold_time) = session.config.hold_time {
-        //    session.set_hold_time(hold_time);
-        //}
-
-        session
+            hold_timer: Timer::new(attributes.hold_time().into()),
+            keepalive_timer: Timer::new(u64::from(attributes.hold_time() / 3))
+        }
     }
 
     pub fn details(&self) -> (Option<SocketAddr>, Asn) {
-        //(self.connection.as_ref().and_then(|c| c.stream.peer_addr().ok()), self.config.remote_asn)
         (self.connection.stream.peer_addr().ok(), self.config.remote_asn)
     }
 
@@ -362,12 +349,10 @@ impl Session {
             }
             // Timers expiring:
             _ = self.keepalive_timer.tick() => {
-                //debug!("keepalive_timer tick'd, sending KEEPALIVE");
-                self.send_keepalive()
+                self.handle_event(Event::KeepaliveTimerExpires).await?;
             }
             _ = self.hold_timer.tick() => {
-                //debug!("Hold time expired, disconnecting");
-                self.disconnect(DisconnectReason::HoldTimerExpired).await;
+                self.handle_event(Event::HoldTimerExpires).await?;
             }
         }
         Ok(())
@@ -524,7 +509,7 @@ impl Session {
                let _ = tx.send(Message::NotificationMessage(m)).await;
            }
        }
-       self.hold_timer.reset();
+       self.hold_timer.reset().await;
        Ok(())
     }
 
@@ -652,6 +637,7 @@ impl Session {
 
                     //  - set the HoldTimer to a large value (suggested: 4min)
                     //  TODO
+
 
                     //  - changes its state to OpenSent.
                     self.set_state(State::OpenSent);
@@ -962,7 +948,7 @@ impl Session {
             (S::OpenSent, E::HoldTimerExpires) => {
                 //- sends a NOTIFICATION message with the error code Hold
                 //Timer Expired,
-                // TODO tokio
+                self.disconnect(DisconnectReason::HoldTimerExpired).await;
 
                 //- sets the ConnectRetryTimer to zero,
                 self.start_connect_retry_timer();
@@ -971,7 +957,7 @@ impl Session {
                 // TODO something?
 
                 //- drops the TCP connection,
-                // TODO tokio
+                // already done in self.disconnect();
 
                 //- increments the ConnectRetryCounter,
                 self.increase_connect_retry_counter();
@@ -1062,8 +1048,6 @@ impl Session {
                 }
 
                 //- sends a KEEPALIVE message, and
-                // TODO tokio
-                //self.handler.send_raw(KeepaliveBuilder::new_vec().finish());
                 self.send_keepalive();
 
                 //- sets a KeepaliveTimer:
@@ -1074,11 +1058,14 @@ impl Session {
                 // "internal" connection; otherwise, it is an "external"
                 // connection.  (This will impact UPDATE processing as
                 // described below.)
-                // TODO
+                self.keepalive_timer.start();
 
                 //- sets the HoldTimer according to the negotiated value (see
                 //  Section 4.2),
-                //  TODO
+                //
+                //  Not very clear from the standard if we also need to
+                //  actually start it, but it makes sense to do so.
+                self.hold_timer.start();
 
                 //- changes its state to OpenConfirm.
                 self.set_state(State::OpenConfirm);
@@ -1189,7 +1176,7 @@ impl Session {
             (S::OpenConfirm, E::HoldTimerExpires) => {
                 //- sends the NOTIFICATION message with the Error Code Hold
                 //Timer Expired,
-                // TODO tokio
+                self.disconnect(DisconnectReason::HoldTimerExpired).await;
 
                 //- sets the ConnectRetryTimer to zero,
                 self.start_connect_retry_timer();
@@ -1198,7 +1185,7 @@ impl Session {
                 // TODO something?
 
                 //- drops the TCP connection,
-                // TODO tokio
+                // already done in self.disconnect()
 
                 //- increments the ConnectRetryCounter by 1,
                 self.increase_connect_retry_counter();
@@ -1212,10 +1199,12 @@ impl Session {
             }
             (S::OpenConfirm, E::KeepaliveTimerExpires) => {
                 //- sends a KEEPALIVE message,
-                // TODO tokio
+                self.send_keepalive();
 
                 //- restarts the KeepaliveTimer, and
-                // TODO
+                // Our Timer restarts automatically after expiring, though we
+                // could be extra explicit by calling:
+                // self.keepalive_timer.reset().await;
 
                 //- remains in the OpenConfirmed state.
                 // noop
@@ -1393,7 +1382,7 @@ impl Session {
 
                 //- sends a NOTIFICATION message with the Error Code Hold Timer
                 //  Expired,
-                //  TODO tokio
+                self.disconnect(DisconnectReason::HoldTimerExpired).await;
 
                 //- sets the ConnectRetryTimer to zero,
                 self.start_connect_retry_timer();
@@ -1402,7 +1391,7 @@ impl Session {
                 // TODO store
 
                 //- drops the TCP connection,
-                //TODO tokio
+                // already done in self.disconnect();
 
                 //- increments the ConnectRetryCounter by 1,
                 self.increase_connect_retry_counter();
@@ -1416,11 +1405,11 @@ impl Session {
             }
             (S::Established, E::KeepaliveTimerExpires) => {
                 //- sends a KEEPALIVE message, and
-                // TODO tokio
+                self.send_keepalive();
 
-                //- restarts its KeepaliveTimer, unless the negotiated HoldTime
-                //  value is zero.
-                //  TODO
+                //- restarts its KeepaliveTimer, unless the negotiated
+                //  HoldTime value is zero.
+                //  Our Timer restarts automatically after expiring.
             }
             // optional:
             // (S::Established, E::TcpConnectionValid) => { todo!() }

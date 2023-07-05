@@ -1,7 +1,11 @@
-use tokio::time::{interval, Interval, Instant};
+use tokio::time::{interval, Instant};
 use std::time::Duration;
+use std::fmt;
+use std::cmp;
 
-use log::debug;
+use tokio::sync::{mpsc, oneshot};
+
+use log::{debug, warn};
 
 // TODO
 //  - write out what all these do
@@ -49,56 +53,111 @@ use log::debug;
 
 #[derive(Debug)]
 pub struct Timer {
-    //orig_interval: Duration,
+    interval: Duration,
     started: bool,
-    interval: Interval,
     last_tick: Instant,
+    last_reset: Instant,
+    tick_recv: mpsc::Receiver<Instant>,
+    tick_send: mpsc::Sender<Instant>,
+    stop_send: Option<oneshot::Sender<()>>,
+    reset_send: Option<mpsc::Sender<()>>,
 }
+
 impl Timer {
+    /// Creates a new timer with an interval of `secs`.
     pub fn new(secs: u64) -> Self {
+        let (tick_send, tick_recv) = mpsc::channel(3);
         Self {
-            //orig_interval: Duration::from_secs(secs),
-            started: true,
-            interval: interval(Duration::from_secs(secs)),
+            interval: Duration::from_secs(secs),
+            started: false,
+            //interval: interval(Duration::from_secs(secs)),
             last_tick: Instant::now(),
+            last_reset: Instant::now(),
+            tick_recv,
+            tick_send,
+            stop_send: None,
+            reset_send: None,
         }
     }
 
-    pub async fn tick(&mut self) {
-        self.last_tick = self.interval.tick().await;
-    }
-
-    pub fn start(&mut self) {
-        //self.interval = interval(self.orig_interval);
-        self.started = true;
-        self.reset();
-        let _ = self.interval.tick();
-    }
-
-    //pub fn stop(&mut self) {
-    //    //self.interval = interval(Duration::ZERO);
-    //    self.started = false;
-    //}
-
-    pub fn reset(&mut self) {
-        self.interval.reset();
-    }
-
-    fn next_tick(&self) -> Instant {
-        self.last_tick + self.interval.period()
-    }
-
-    pub fn until_next_tick(&self) -> Duration {
-        self.next_tick() - Instant::now()
-    }
-
-    fn last_tick(&self) -> Instant {
+    pub async fn tick(&mut self) -> Instant {
+        self.last_tick = self.tick_recv.recv().await.expect("channel should never close");
         self.last_tick
     }
 
-    pub fn since_last_tick(&self) -> Duration {
-        //Instant::now().duration_since(self.last_tick)
-        self.last_tick.elapsed()
+    pub fn start(&mut self) {
+        self.started = true;
+        let (stop_send, stop_recv) = oneshot::channel();
+        let (reset_send, reset_recv) = mpsc::channel(1);
+
+        self.stop_send = Some(stop_send);
+        self.reset_send = Some(reset_send);
+
+        let tick_send = self.tick_send.clone();
+        let interval = self.interval.clone();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = Self::timer_inner(interval, tick_send, reset_recv) => { },
+                _ = stop_recv => {
+                    debug!("timer stopped");
+                }
+            }
+        });
+    }
+
+    async fn timer_inner(
+        i: Duration,
+        tick_send: mpsc::Sender<Instant>,
+        mut reset_recv: mpsc::Receiver<()>,
+    ) {
+        let mut interval = interval(i);
+        let tick_send = tick_send.clone();
+        interval.tick().await;
+        loop {
+            tokio::select!{
+                instant = interval.tick() => {
+                    let _ = tick_send.send(instant).await;
+                }
+                _ = reset_recv.recv() => {
+                    interval.reset();
+                }
+            }
+        }
+    }
+
+    pub fn stop_and_reset(&mut self) {
+        if let Some(tx) = self.stop_send.take() {
+            let _ = tx.send(());
+            self.last_reset = Instant::now();
+        } else {
+            warn!("trying to stop stopped timer");
+        }
+        self.started = false;
+    }
+
+    pub async fn reset(&mut self) {
+        if let Some(tx) = &self.reset_send {
+            let _ = tx.send(()).await;
+            self.last_reset = Instant::now();
+        } else {
+            warn!("truing to reset a stopped timer");
+        }
+    }
+}
+
+impl fmt::Display for Timer {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let since = cmp::max(self.last_tick, self.last_reset);
+        let togo = self.interval.checked_sub(
+            Instant::now().duration_since(since)
+        ).unwrap_or_default(); // Default is Duration::ZERO
+
+        write!(f, "{:.2}/{} {}",
+               togo.as_secs_f64(),
+               self.interval.as_secs(),
+               if self.started { "" } else { "(stopped)" }
+        )
     }
 }
 
@@ -111,35 +170,59 @@ mod tests {
     use super::*;
     use tokio::time::{sleep, timeout};
 
+    #[allow(dead_code)]
     fn ptime() {
         println!("ptime: {:?}", Instant::now());
     }
 
     #[tokio::test]
     async fn works() {
-        ptime();
-        let mut t = Timer::new(1);
-        t.start();
-        ptime();
-        let _ = t.tick().await;
-        ptime();
-        let _ = t.tick().await;
-        ptime();
-        let _ = t.tick().await;
-        ptime();
-        //t.stop();
-        println!("{t:?}");
-        //sleep(Duration::from_millis(2000)).await;
+        let secs = 1;
+        let mut t = Timer::new(secs);
+        let d = Duration::from_secs(secs);
 
-        if let Err(_) = timeout(Duration::from_secs(5), t.tick()).await {
-            println!("did not receive value within 5s");
+        println!("{t}");
+        let tstart = Instant::now();
+        t.start();
+
+        println!("{t}");
+
+        let t0 = t.tick().await;
+        assert!(tstart.elapsed() >= d);
+        assert!(t0.elapsed() < d);
+        let t1 = t.tick().await;
+        assert!(t0.elapsed() >= d);
+        let t2 = t.tick().await;
+        assert!(t1.elapsed() >= d);
+        let t3 = t.tick().await;
+        assert!(t2.elapsed() >= d);
+
+        sleep(Duration::from_millis(500)).await;
+        println!("{t}");
+        t.reset().await;
+        println!("{t}");
+        sleep(Duration::from_millis(500)).await;
+        println!("{t}");
+        t.reset().await;
+        println!("{t}");
+        let t4 = t.tick().await;
+        assert!(t3.elapsed() >= 2*d);
+
+        t.stop_and_reset();
+
+        if let Err(_) = timeout(d*2, t.tick()).await {
+            //println!("did not receive value within two intervals, Ok");
+            assert!(t4.elapsed() >= d*2);
+        } else {
+            panic!("wrong");
         }
 
-        ptime();
+        println!("{t}");
+
+        let t5 = Instant::now();
         t.start();
-        t.tick().await;
-        ptime();
+        let _ = t.tick().await;
+        assert!(t5.elapsed() >= d);
 
     }
-
 }
