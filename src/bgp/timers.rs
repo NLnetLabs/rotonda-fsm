@@ -66,11 +66,10 @@ pub struct Timer {
 impl Timer {
     /// Creates a new timer with an interval of `secs`.
     pub fn new(secs: u64) -> Self {
-        let (tick_send, tick_recv) = mpsc::channel(3);
+        let (tick_send, tick_recv) = mpsc::channel(1);
         Self {
             interval: Duration::from_secs(secs),
             started: false,
-            //interval: interval(Duration::from_secs(secs)),
             last_tick: Instant::now(),
             last_reset: Instant::now(),
             tick_recv,
@@ -81,7 +80,8 @@ impl Timer {
     }
 
     pub async fn tick(&mut self) -> Instant {
-        self.last_tick = self.tick_recv.recv().await.expect("channel should never close");
+        self.last_tick = self.tick_recv.recv().await
+            .expect("channel should never close");
         self.last_tick
     }
 
@@ -94,7 +94,7 @@ impl Timer {
         self.reset_send = Some(reset_send);
 
         let tick_send = self.tick_send.clone();
-        let interval = self.interval.clone();
+        let interval = self.interval;
 
         tokio::spawn(async move {
             tokio::select! {
@@ -136,12 +136,16 @@ impl Timer {
         self.started = false;
     }
 
+    pub fn is_running(&self) -> bool {
+        self.started
+    }
+
     pub async fn reset(&mut self) {
         if let Some(tx) = &self.reset_send {
             let _ = tx.send(()).await;
             self.last_reset = Instant::now();
         } else {
-            warn!("truing to reset a stopped timer");
+            warn!("trying to reset a stopped timer");
         }
     }
 }

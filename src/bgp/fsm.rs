@@ -3,6 +3,8 @@ use std::time::Instant;
 use routecore::bgp::message::OpenMessage;
 use bytes::Bytes;
 
+use super::session::BasicConfig;
+
 
 // The SessionAttributes struct keeps track of all the
 // parameters/counters/values as described in RFC4271. Fields that we
@@ -37,6 +39,19 @@ pub struct SessionAttributes {
     keepalive_timer: u16,
     keepalive_time: u16, //nr 8
 
+
+    // optional DelayOpen 
+    delay_open: bool,        // is DelayOpen enabled on this session?
+    delay_open_time: u16,     // initial value
+    // NB: this is probably not necessary because how we do timers
+    //DelayOpenTimer: u16,    // current value
+
+    // optional PassiveTcpEstablishment:
+    passive_tcp_establishment: bool,
+
+    // optional SendNOTIFICATIONwithoutOPEN:
+    send_notification_without_open: bool,
+
     // optional
 /*
     AcceptConnectionsUnconfiguredPeers, // nr 1, etc
@@ -62,6 +77,22 @@ impl SessionAttributes {
         Self::default()
     }
 
+    pub fn from_basic_config(config: &BasicConfig) -> Self {
+        let mut res = Self::default();
+        if let Some(hold_time) = config.hold_time {
+            res.set_hold_time(hold_time);
+        }
+        res
+    }
+
+    pub fn from_bgp_config<C: super::session::BgpConfig>(config: &C) -> Self {
+        let mut res = Self::default();
+        if let Some(hold_time) = config.hold_time() {
+            res.set_hold_time(hold_time);
+        }
+        res
+    }
+
     pub fn hold_time(&self) -> u16 {
         self.hold_time
     }
@@ -73,18 +104,36 @@ impl SessionAttributes {
         self.state
     }
 
-    pub fn connect_retry_tick(&mut self, t: Instant) {
-        self.connect_retry_last_tick = Some(t);
+    pub fn connect_retry_time(&self) -> u16 {
+        self.connect_retry_time
     }
-    pub fn reset_connect_retry(&mut self) {
+
+    pub fn reset_connect_retry_counter(&mut self) {
         self.connect_retry_counter = 0;
-    }
-    pub fn stop_connect_retry(&mut self) {
-        self.connect_retry_last_tick = None;
     }
 
     pub fn increase_connect_retry_counter(&mut self) {
         self.connect_retry_counter += 1;
+    }
+
+    pub fn enable_delay_open(&mut self) {
+        self.delay_open = true;
+    }
+
+    pub fn delay_open(&self) -> bool {
+        self.delay_open
+    }
+
+    pub fn delay_open_time(&self) -> u16 {
+        self.delay_open_time
+    }
+
+    pub fn passive_tcp_establishment(&self) -> bool {
+        self.passive_tcp_establishment
+    }
+
+    pub fn notification_without_open(&self) -> bool {
+        self.send_notification_without_open
     }
 
     pub fn set_state(&mut self, state: State) {
@@ -105,6 +154,11 @@ impl Default for SessionAttributes {
             hold_time: 90,
             keepalive_timer: 30,
             keepalive_time: 30,
+            // optionals:
+            delay_open: false,
+            delay_open_time: 10,
+            passive_tcp_establishment: true,
+            send_notification_without_open: true,
         }
     }
 }
@@ -125,11 +179,12 @@ pub enum Event {
     ManualStart, // 1
     ManualStop, // 2
 
-    /*  events 3 - 8
-    // optional
-    AutomaticStart, 
-    ManualStartWithPassiveTcpEstablishment,
-    AutomaticStartWithPassiveTcpEstablishment,
+    // optional 3-5
+    AutomaticStart,  //3
+    ManualStartWithPassiveTcpEstablishment, // 4
+    AutomaticStartWithPassiveTcpEstablishment, // 5
+
+    /*  events 6 - 8, also optional
     AutomaticStartWithDampPeerOscillations,
     AutomaticStartWithDampPeerOscillationsAndPassiveTcpEstablishment,
     AutomaticStop,
@@ -142,9 +197,9 @@ pub enum Event {
     HoldTimerExpires, // 10
     KeepaliveTimerExpires, // 11
 
-    /*
-    // optional timer events
     DelayOpenTimerExpires, // 12
+    /*
+    // other optional timer events
     IdleHoldTimerExpires, // 13
     */
 
@@ -173,10 +228,11 @@ pub enum Event {
     UpdateMsgErr, // 28
 
 
-    /*
-    // optional BGP message-based events
+    BgpOpenWithDelayOpenTimerRunning(OpenMessage<Bytes>), // optional event 20
+
+    /* 
+    // other optional BGP message-based events
     
-    BgpOpenWithDelayOpenTimerRunning, // event 20
     OpenCollisionDump, // event 23
     */
 
