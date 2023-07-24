@@ -161,6 +161,11 @@ impl<C: BgpConfig> Session<C> {
 
     async fn disconnect(&mut self, reason: DisconnectReason) {
         match reason {
+            DisconnectReason::ConnectionRejected => {
+                self.send_notification(
+                    CeaseSubcode::ConnectionRejected
+                )
+            }
             DisconnectReason::Reconfiguration => {
                 self.send_notification(
                     CeaseSubcode::OtherConfigurationChange
@@ -1732,6 +1737,7 @@ pub enum Command {
 /// (sub)code depending on the variant.
 #[derive(Debug)]
 pub enum DisconnectReason {
+    ConnectionRejected,
     Reconfiguration,
     Deconfigured,
     HoldTimerExpired,
