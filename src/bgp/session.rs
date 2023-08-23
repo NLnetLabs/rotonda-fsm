@@ -244,6 +244,9 @@ impl<C: BgpConfig> Session<C> {
                     Command::ForcedKeepalive => {
                         self.send_keepalive()
                     }
+                    Command::RawUpdate(pdu) => {
+                        self.send_raw(pdu.as_ref().to_vec())
+                    }
                 }
             }
             // message from peer:
@@ -1729,6 +1732,7 @@ pub enum Command {
     GetAttributes { resp: oneshot::Sender<SessionAttributes> },
     Disconnect(DisconnectReason),
     ForcedKeepalive,
+    RawUpdate(UpdateMessage<Vec<u8>>),
 }
 
 /// Reason for disconnecting the peer.
