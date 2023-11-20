@@ -10,12 +10,11 @@ readme = "README.md"
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
+env_logger = "0.9.0"
 tokio = { version = "1", features = ["io-std", "signal"] }
-
 
 [dependencies]
 bytes = "1.1.0"
-env_logger = "0.9.0"
 log = { version = "0.4.17" }
 octseq = { git = "https://github.com/NLnetLabs/octseq", features = ["bytes"] }
 routecore = { version = "0.4.0-dev", features = ["bgp", "bmp"], git = "https://github.com/NLnetLabs/routecore.git", branch = "compose-messages-ng" }
