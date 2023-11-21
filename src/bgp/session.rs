@@ -448,6 +448,9 @@ impl<C: BgpConfig> Session<C> {
                let tx = self.channel.clone();
                let _ = tx.send(Message::NotificationMessage(m)).await;
            }
+           BgpMsg::RouteRefresh(_m) => {
+               debug!("got ROUTEREFRESH, not doing anything");
+           }
        }
        Ok(())
     }
