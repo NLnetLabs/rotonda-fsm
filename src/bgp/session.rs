@@ -338,14 +338,11 @@ impl<C: BgpConfig> Session<C> {
         openbuilder.set_holdtime(self.attributes.hold_time());
         openbuilder.set_bgp_id(self.config.bgp_id());
 
-        // XXX these should come from our 'local config'
-        //for _c in &self.config.capabilities {
-        //    // TODO add all capabilities
-        //}
-        // for now, just fake these:
         openbuilder.four_octet_capable(self.config.local_asn());
-        openbuilder.add_mp(AFI::Ipv4, SAFI::Unicast);
-        openbuilder.add_mp(AFI::Ipv6, SAFI::Unicast);
+
+        for (afi, safi) in self.config.protocols() {
+            openbuilder.add_mp(afi, safi);
+        }
 
         // and for our bgpsink, we should copy all the capabilities
         // from the received OPEN
@@ -1839,6 +1836,8 @@ pub trait BgpConfig {
     fn remote_asn_allowed(&self, remote_asn: Asn) -> bool;
     fn hold_time(&self) -> Option<u16>;
     fn is_exact(&self) -> bool;
+
+    fn protocols(&self) -> Vec<(AFI, SAFI)>;
 }
 
 //------------ BasicConfig ---------------------------------------------------
@@ -1904,6 +1903,13 @@ impl BgpConfig for BasicConfig {
 
     fn is_exact(&self) -> bool {
         true
+    }
+
+    fn protocols(&self) -> Vec<(AFI, SAFI)> {
+        vec![
+            (AFI::Ipv4, SAFI::Unicast),
+            (AFI::Ipv6, SAFI::Unicast),
+        ]
     }
 }
 
