@@ -21,7 +21,7 @@ use routecore::bgp::message::notification::{
     FiniteStateMachineSubcode
 };
 use routecore::bgp::message::open::{Capability, OpenBuilder};
-use routecore::bgp::types::{AFI, SAFI};
+use routecore::bgp::types::AfiSafi;
 
 use crate::bgp::timers::Timer;
 use crate::bgp::fsm::{Event, SessionAttributes, State};
@@ -340,7 +340,7 @@ impl<C: BgpConfig> Session<C> {
 
         openbuilder.four_octet_capable(self.config.local_asn());
 
-        for (afi, safi) in self.config.protocols() {
+        for (afi, safi) in self.config.protocols().iter().map(|a| a.split()) {
             openbuilder.add_mp(afi, safi);
         }
 
@@ -1837,7 +1837,7 @@ pub trait BgpConfig {
     fn hold_time(&self) -> Option<u16>;
     fn is_exact(&self) -> bool;
 
-    fn protocols(&self) -> Vec<(AFI, SAFI)>;
+    fn protocols(&self) -> Vec<AfiSafi>;
 }
 
 //------------ BasicConfig ---------------------------------------------------
@@ -1905,10 +1905,10 @@ impl BgpConfig for BasicConfig {
         true
     }
 
-    fn protocols(&self) -> Vec<(AFI, SAFI)> {
+    fn protocols(&self) -> Vec<AfiSafi> {
         vec![
-            (AFI::Ipv4, SAFI::Unicast),
-            (AFI::Ipv6, SAFI::Unicast),
+            AfiSafi::Ipv4Unicast,
+            AfiSafi::Ipv6Unicast,
         ]
     }
 }
