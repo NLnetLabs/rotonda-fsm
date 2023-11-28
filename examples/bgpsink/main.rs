@@ -5,7 +5,14 @@ use clap::Parser;
 use env_logger::Env;
 #[allow(unused_imports)]
 use log::{debug, info, warn, error};
-use rotonda_fsm::bgp::session::{Command, Config, Session as BgpSession, Message};
+use rotonda_fsm::bgp::session::{
+    BasicConfig,
+    BgpConfig,
+    Command,
+    DisconnectReason,
+    Message,
+    Session as BgpSession,
+};
 use routecore::bgp::message::{
     update::UpdateMessage,
     notification::NotificationMessage
@@ -39,6 +46,7 @@ struct BgpSpeaker {
     local_addr: IpAddr,
     local_port: u16,
     local_asn: u32,
+    remote_asn: u32,
     bgp_id: [u8; 4],
     pcap_fh: Option<File>,
 }
@@ -55,6 +63,7 @@ impl BgpSpeaker {
             local_addr: args.addr,
             local_port: args.port,
             local_asn: args.asn,
+            remote_asn: args.remote_asn,
             bgp_id: args.asn.to_be_bytes(),
             pcap_fh,
         }
@@ -97,7 +106,7 @@ impl BgpSpeaker {
                         CliCommand::Exit => {
                             debug!("got Exit from CLI, emitting Disconnect commands to sessions");
                             for s in &*shared_sessions.lock().await {
-                                let _  =s.send(Command::Disconnect).await;
+                                let _ = s.send(Command::Disconnect(DisconnectReason::Shutdown)).await;
                             }
                             break 'outer;
                         }
@@ -122,10 +131,12 @@ impl BgpSpeaker {
                 if let Ok((socket, remote_ip)) = listener.accept().await  {
                     info!("BgpSpeaker::run: connection from {}", remote_ip);
 
-                    let config = Config::new(
+                    let config = BasicConfig::new(
                         self.local_asn.into(),
                         self.bgp_id,
-                        remote_ip.ip()
+                        remote_ip.ip(),
+                        self.remote_asn.into(),
+                        None,
                     );
 
                     let socket_status = tokio::join!(
@@ -143,7 +154,7 @@ impl BgpSpeaker {
                     // returned tx_commands: send commands to Session
                     if let Ok((session, tx_commands)) = BgpSession::try_for_connection(
                         config, socket, tx
-                        ) {
+                        ).await {
                         let tx_commands_for_speaker = tx_commands.clone();
                         let mut sessions = self.sessions.lock().await;
                         sessions.push(tx_commands_for_speaker);
@@ -185,20 +196,11 @@ impl Processor {
 
     fn process_update(&mut self, upd: UpdateMessage<Bytes>) {
         self.log_pcap(&upd);
-        if let Some(as_path) = upd.aspath() {
-            info!("got path {as_path} for {} {} prefix(es)",
-            upd.nlris().iter().count(),
-            upd.nlris().afi(),
+        if let Ok(Some(mp)) = upd.mp_announcements() {
+            info!("update for {}/{}, {} announcements", 
+                mp.afi(), mp.safi(),
+                mp.iter().count(),
             );
-            if as_path.segments().count() == 0 {
-                warn!("empty as_path!\n{}", to_pcap(&upd));
-            }
-            //for n in upd.nlris().iter() {
-            //    info!("got route {as_path} {n}");
-            //}
-        }
-        for w in upd.withdrawals().iter() {
-            info!("withdraw: {w}");
         }
     }
 
@@ -214,26 +216,38 @@ impl Processor {
         Processor { rx, _commands, pcap_fh }
     }
 
-    async fn process(
+    async fn process<C: BgpConfig>(
         &mut self,
-        session: BgpSession,
+        mut session: BgpSession<C>,
     ) {
         debug!("Processor::process");
-        tokio::spawn(async {
-            session.process().await;
-        });
 
-        while let Some(msg) = self.rx.recv().await {
-            match msg {
-                Message::UpdateMessage(pdu) => self.process_update(pdu),
-                Message::NotificationMessage(pdu) => self.process_notification(pdu),
-                // TODO this should go via a oneshot back to an emitted CLI
-                // command
-                Message::Attributes(attr) => {
-                    info!("got attributes: state: {:?}", attr.state())
+        loop {
+            tokio::select! {
+                _ = session.tick() => { },
+                Some(msg) = self.rx.recv() => {
+                    match msg {
+                        Message::UpdateMessage(pdu) => self.process_update(pdu),
+                        Message::NotificationMessage(pdu) => self.process_notification(pdu),
+                        // TODO this should go via a oneshot back to an emitted CLI
+                        // command
+                        Message::Attributes(attr) => {
+                            info!("got attributes: state: {:?}", attr.state())
+                        }
+                        Message::SessionNegotiated(config) => {
+                            info!("Session negotiated: {:#?}", config);
+                        }
+                        Message::ConnectionLost(socket) => {
+                            info!("connection lost: {}", socket);
+                            break;
+                        }
+                    }
                 }
+
+
             }
         }
+
     }
 }
 
@@ -251,6 +265,10 @@ struct Args {
     /// Local ASN.
     #[arg(long)]
     asn: u32,
+
+    /// Remote ASN.
+    #[arg(long)]
+    remote_asn: u32,
 
     /// File to log hexdumps of packets.
     #[arg(long)]
