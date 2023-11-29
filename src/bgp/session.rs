@@ -2008,6 +2008,17 @@ impl NegotiatedConfig {
     pub fn addpath_families(&self) -> &[AfiSafi] {
         &self.addpath[..]
     }
+
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        NegotiatedConfig {
+            hold_time: 0,
+            remote_bgp_id: [1, 2, 3, 4],
+            remote_asn: Asn::from_u32(12345),
+            remote_addr: IpAddr::V4([1, 2, 3, 4].into()),
+            addpath: vec![]
+        }
+    }
 }
 
 
