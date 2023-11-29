@@ -1981,7 +1981,7 @@ impl From<UnexpectedPeer> for ConnectionError {
 }
 
 
-
+#[derive(Debug)]
 pub struct Error {
     msg: &'static str,
 }
