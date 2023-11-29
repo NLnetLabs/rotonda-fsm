@@ -149,10 +149,18 @@ impl<C: BgpConfig> Session<C> {
     /// Sets the negotiated config.
     pub fn set_negotiated_config(&mut self, config: NegotiatedConfig) {
         self.negotiated = Some(config);
+        // FIXME make this per address family once SessionConfig supports that
+        if let Some(sc) = self.connection.as_mut() {
+            if !self.negotiated.as_ref().unwrap().addpath.is_empty() {
+                sc.session_config_mut().enable_addpath();
+            }
+        } else {
+            warn!("set_negotiated_config: no Connection for Session");
+        }
     }
     /// Returns the negotiated config.
-    pub fn negotiated(&self) -> Option<NegotiatedConfig> {
-        self.negotiated
+    pub fn negotiated(&self) -> Option<&NegotiatedConfig> {
+        self.negotiated.as_ref()
     }
 
     async fn drop_connection(&mut self) {
@@ -895,6 +903,19 @@ impl<C: BgpConfig> Session<C> {
                     self.set_state(State::Idle);
                     return Err(Error { msg: "stop processing" })
                 }
+
+                let received_addpaths = open_msg.addpath_families_vec()
+                    .map_err(|_| Error { msg: "failed to parse addpath caps" })?;
+                let union = received_addpaths.iter().filter(|(fam, dir)|{
+                    matches!(
+                        dir,
+                        AddpathDirection::Send |
+                        AddpathDirection::SendReceive
+                    ) &&
+                    self.config.addpath().contains(&fam)
+                }).map(|(fam, _dir)| *fam).collect::<Vec<_>>();
+                debug!("addpath union: {:?}", &union);
+
                 let negotiated = NegotiatedConfig {
                     hold_time: std::cmp::min(open_msg.holdtime(), self.hold_time()),
                     // TODO rename .identifier() and its return type in
@@ -902,12 +923,11 @@ impl<C: BgpConfig> Session<C> {
                     remote_bgp_id: open_msg.identifier()[0..4].try_into().unwrap(),
                     remote_asn: open_msg.my_asn(),
                     // XXX yeah..
-                    remote_addr: self.connection.as_ref().unwrap().stream.peer_addr().unwrap().ip()
+                    remote_addr: self.connection.as_ref().unwrap().stream.peer_addr().unwrap().ip(),
+                    addpath: union,
                 };
                 self.send_open();
-                self.set_negotiated_config(negotiated);
-                let _ = self.channel.send(Message::SessionNegotiated(negotiated)).await;
-
+                self.set_negotiated_config(negotiated.clone());
                 debug!(
                     "Negotiated: {}@{} id {:?}, hold time {}s",
                     negotiated.remote_asn,
@@ -915,6 +935,8 @@ impl<C: BgpConfig> Session<C> {
                     negotiated.remote_bgp_id,
                     negotiated.hold_time,
                 );
+                let _ = self.channel.send(Message::SessionNegotiated(negotiated)).await;
+
 
                 //- sends a KEEPALIVE message,
                 self.send_keepalive();
@@ -1180,6 +1202,19 @@ impl<C: BgpConfig> Session<C> {
                     self.set_state(State::Idle);
                     return Err(Error { msg: "stop processing" })
                 }
+
+                let received_addpaths = open_msg.addpath_families_vec()
+                    .map_err(|_| Error { msg: "failed to parse addpath caps" })?;
+                let union = received_addpaths.iter().filter(|(fam, dir)|{
+                    matches!(
+                        dir,
+                        AddpathDirection::Send |
+                        AddpathDirection::SendReceive
+                    ) &&
+                    self.config.addpath().contains(&fam)
+                }).map(|(fam, _dir)| *fam).collect::<Vec<_>>();
+                debug!("addpath union: {:?}", &union);
+
                 let negotiated = NegotiatedConfig {
                     hold_time: std::cmp::min(open_msg.holdtime(), self.hold_time()),
                     // TODO rename .identifier() and its return type in
@@ -1187,10 +1222,9 @@ impl<C: BgpConfig> Session<C> {
                     remote_bgp_id: open_msg.identifier()[0..4].try_into().unwrap(),
                     remote_asn: open_msg.my_asn(),
                     // XXX yeah..
-                    remote_addr: self.connection.as_ref().unwrap().stream.peer_addr().unwrap().ip()
+                    remote_addr: self.connection.as_ref().unwrap().stream.peer_addr().unwrap().ip(),
+                    addpath: union,
                 };
-                self.set_negotiated_config(negotiated);
-                let _ = self.channel.send(Message::SessionNegotiated(negotiated)).await;
 
                 debug!(
                     "Negotiated: {}@{} id {:?}, hold time {}s",
@@ -1199,6 +1233,10 @@ impl<C: BgpConfig> Session<C> {
                     negotiated.remote_bgp_id,
                     negotiated.hold_time,
                 );
+
+
+                self.set_negotiated_config(negotiated.clone());
+                let _ = self.channel.send(Message::SessionNegotiated(negotiated)).await;
 
                 //- sends a KEEPALIVE message, and
                 self.send_keepalive();
@@ -1765,6 +1803,7 @@ pub struct Connection {
     remote_addr: SocketAddr,
     stream: TcpStream,
     buffer: BytesMut,
+    session_config: SessionConfig,
 }
 
 impl Connection {
@@ -1774,7 +1813,12 @@ impl Connection {
             remote_addr: stream.peer_addr().unwrap(),
             stream,
             buffer: BytesMut::with_capacity(2^20),
+            session_config: SessionConfig::modern(),
         }
+    }
+
+    pub fn session_config_mut(&mut self) -> &mut SessionConfig {
+        &mut self.session_config
     }
 
     async fn disconnect(&mut self) {
@@ -1942,22 +1986,27 @@ impl BgpConfig for BasicConfig {
 // TODO impl Into<SessionConfig> (or Into<ParseInfo>, rather)
 // TODO create convenience functions to create a NegotiatedConfig from a
 // BgpConfig and an OpenMessage.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct NegotiatedConfig {
     //capabilities: Vec<Capability<Vec<u8>>,
     hold_time: u16, // smaller of the two OPENs, 0 or >= 3
     remote_bgp_id: [u8; 4],
     remote_asn: Asn,
     remote_addr: IpAddr,
+    addpath: Vec<AfiSafi>,
 }
 
 impl NegotiatedConfig {
-    pub fn remote_asn(self) -> Asn {
+    pub fn remote_asn(&self) -> Asn {
         self.remote_asn
     }
 
-    pub fn remote_addr(self) -> IpAddr {
+    pub fn remote_addr(&self) -> IpAddr {
         self.remote_addr
+    }
+
+    pub fn addpath_families(&self) -> &[AfiSafi] {
+        &self.addpath[..]
     }
 }
 
