@@ -1858,7 +1858,7 @@ impl Connection {
                 let b = Bytes::copy_from_slice(&buf.into_inner()[..len.into()]);
                 // XXX the SessionConfig needs to be updated based on the
                 // exchanged BGP OPENs
-                let msg = BgpMsg::from_octets(b, Some(SessionConfig::modern()))?;
+                let msg = BgpMsg::from_octets(b, Some(self.session_config))?;
                 self.buffer.advance(len.into());
                 return Ok(Some(msg));
             }
