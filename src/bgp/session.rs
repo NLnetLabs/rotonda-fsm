@@ -2009,7 +2009,7 @@ impl NegotiatedConfig {
         &self.addpath[..]
     }
 
-    #[cfg(test)]
+    /// Dummy constructor, only useful for testing.
     pub fn dummy() -> Self {
         NegotiatedConfig {
             hold_time: 0,
