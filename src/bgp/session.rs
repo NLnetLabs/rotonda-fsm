@@ -20,7 +20,11 @@ use routecore::bgp::message::notification::{
     NotificationBuilder, CeaseSubcode, Details, OpenMessageSubcode,
     FiniteStateMachineSubcode
 };
-use routecore::bgp::message::open::{Capability, OpenBuilder};
+use routecore::bgp::message::open::{
+    AddpathDirection,
+    Capability,
+    OpenBuilder
+};
 use routecore::bgp::types::AfiSafi;
 
 use crate::bgp::timers::Timer;
@@ -342,6 +346,10 @@ impl<C: BgpConfig> Session<C> {
 
         for (afi, safi) in self.config.protocols().iter().map(|a| a.split()) {
             openbuilder.add_mp(afi, safi);
+        }
+
+        for fam in self.config.addpath().into_iter() {
+            openbuilder.add_addpath(fam, AddpathDirection::SendReceive);
         }
 
         // and for our bgpsink, we should copy all the capabilities
@@ -1838,6 +1846,7 @@ pub trait BgpConfig {
     fn is_exact(&self) -> bool;
 
     fn protocols(&self) -> Vec<AfiSafi>;
+    fn addpath(&self) -> Vec<AfiSafi>;
 }
 
 //------------ BasicConfig ---------------------------------------------------
@@ -1910,6 +1919,10 @@ impl BgpConfig for BasicConfig {
             AfiSafi::Ipv4Unicast,
             AfiSafi::Ipv6Unicast,
         ]
+    }
+
+    fn addpath(&self) -> Vec<AfiSafi> {
+        vec![]
     }
 }
 
