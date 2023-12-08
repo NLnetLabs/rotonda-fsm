@@ -21,11 +21,10 @@ use routecore::bgp::message::notification::{
     FiniteStateMachineSubcode
 };
 use routecore::bgp::message::open::{
-    AddpathDirection,
     Capability,
     OpenBuilder
 };
-use routecore::bgp::types::AfiSafi;
+use routecore::bgp::types::{AfiSafi, AddpathDirection, AddpathFamDir};
 
 use crate::bgp::timers::Timer;
 use crate::bgp::fsm::{Event, SessionAttributes, State};
@@ -149,10 +148,9 @@ impl<C: BgpConfig> Session<C> {
     /// Sets the negotiated config.
     pub fn set_negotiated_config(&mut self, config: NegotiatedConfig) {
         self.negotiated = Some(config);
-        // FIXME make this per address family once SessionConfig supports that
         if let Some(sc) = self.connection.as_mut() {
-            if !self.negotiated.as_ref().unwrap().addpath.is_empty() {
-                sc.session_config_mut().enable_addpath();
+            for famdir in self.negotiated.as_ref().unwrap().addpath.iter() {
+                sc.session_config_mut().add_famdir(*famdir);
             }
         } else {
             warn!("set_negotiated_config: no Connection for Session");
@@ -906,15 +904,16 @@ impl<C: BgpConfig> Session<C> {
 
                 let received_addpaths = open_msg.addpath_families_vec()
                     .map_err(|_| Error { msg: "failed to parse addpath caps" })?;
-                let union = received_addpaths.iter().filter(|(fam, dir)|{
+                let intersection = received_addpaths.iter().filter(|(fam, dir)|{
                     matches!(
                         dir,
                         AddpathDirection::Send |
                         AddpathDirection::SendReceive
                     ) &&
-                    self.config.addpath().contains(&fam)
-                }).map(|(fam, _dir)| *fam).collect::<Vec<_>>();
-                debug!("addpath union: {:?}", &union);
+                    self.config.addpath().contains(fam)
+                }).map(|(fam, dir)| AddpathFamDir::new(*fam, *dir)).collect::<Vec<_>>();
+                debug!("addpath intersection: {:?}", &intersection);
+
 
                 let negotiated = NegotiatedConfig {
                     hold_time: std::cmp::min(open_msg.holdtime(), self.hold_time()),
@@ -924,7 +923,7 @@ impl<C: BgpConfig> Session<C> {
                     remote_asn: open_msg.my_asn(),
                     // XXX yeah..
                     remote_addr: self.connection.as_ref().unwrap().stream.peer_addr().unwrap().ip(),
-                    addpath: union,
+                    addpath: intersection,
                 };
                 self.send_open();
                 self.set_negotiated_config(negotiated.clone());
@@ -1205,15 +1204,15 @@ impl<C: BgpConfig> Session<C> {
 
                 let received_addpaths = open_msg.addpath_families_vec()
                     .map_err(|_| Error { msg: "failed to parse addpath caps" })?;
-                let union = received_addpaths.iter().filter(|(fam, dir)|{
+                let intersection = received_addpaths.iter().filter(|(fam, dir)|{
                     matches!(
                         dir,
                         AddpathDirection::Send |
                         AddpathDirection::SendReceive
                     ) &&
-                    self.config.addpath().contains(&fam)
-                }).map(|(fam, _dir)| *fam).collect::<Vec<_>>();
-                debug!("addpath union: {:?}", &union);
+                    self.config.addpath().contains(fam)
+                }).map(|(fam, dir)| AddpathFamDir::new(*fam, *dir)).collect::<Vec<_>>();
+                debug!("addpath intersection: {:?}", &intersection);
 
                 let negotiated = NegotiatedConfig {
                     hold_time: std::cmp::min(open_msg.holdtime(), self.hold_time()),
@@ -1223,7 +1222,7 @@ impl<C: BgpConfig> Session<C> {
                     remote_asn: open_msg.my_asn(),
                     // XXX yeah..
                     remote_addr: self.connection.as_ref().unwrap().stream.peer_addr().unwrap().ip(),
-                    addpath: union,
+                    addpath: intersection,
                 };
 
                 debug!(
@@ -1993,7 +1992,7 @@ pub struct NegotiatedConfig {
     remote_bgp_id: [u8; 4],
     remote_asn: Asn,
     remote_addr: IpAddr,
-    addpath: Vec<AfiSafi>,
+    addpath: Vec<AddpathFamDir>,
 }
 
 impl NegotiatedConfig {
@@ -2003,10 +2002,6 @@ impl NegotiatedConfig {
 
     pub fn remote_addr(&self) -> IpAddr {
         self.remote_addr
-    }
-
-    pub fn addpath_families(&self) -> &[AfiSafi] {
-        &self.addpath[..]
     }
 
     /// Dummy constructor, only useful for testing.
