@@ -11,7 +11,7 @@ readme = "README.md"
 [dependencies]
 bytes       = "1.5.0"
 log         = { version = "0.4.17" }
-octseq      = { git = "https://github.com/NLnetLabs/octseq", features = ["bytes"] }
+octseq      = { version = "0.4.0", features = ["bytes"] }
 routecore   = { version = "0.4.0-rc0", features = ["bgp", "bmp"] }
 tokio       = { version = "1", features = ["io-util", "macros", "net", "sync", "rt-multi-thread", "time"] }
 
