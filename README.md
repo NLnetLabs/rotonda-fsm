@@ -12,7 +12,7 @@ please open an issue in the [GitHub repository]. In particular, if you
 would like to use the crate but it is missing functionality for your use
 case, we would love to hear from you!
 
-[GitHub repository]: (https://github.com/NLnetLabs/rotonda-fsm)
+[GitHub repository]: https://github.com/NLnetLabs/rotonda-fsm
 
 ## License
 
