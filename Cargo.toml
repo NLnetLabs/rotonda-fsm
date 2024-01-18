@@ -1,6 +1,6 @@
 [package]
 name = "rotonda-fsm"
-version = "0.1.0-rc0"
+version = "0.1.0"
 edition = "2021"
 authors = ["NLnet Labs <routing-team@nlnetlabs.nl>"]
 description = "BGP/BMP state machines for Rotonda"
@@ -12,7 +12,7 @@ readme = "README.md"
 bytes       = "1.5.0"
 log         = { version = "0.4.17" }
 octseq      = { version = "0.4.0", features = ["bytes"] }
-routecore   = { version = "0.4.0-rc0", features = ["bgp", "bmp"] }
+routecore   = { version = "0.4.0", features = ["bgp", "bmp"] }
 tokio       = { version = "1", features = ["io-util", "macros", "net", "sync", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
